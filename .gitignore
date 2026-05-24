@@ -12,6 +12,7 @@ venv/
 # experiment outputs — large and reproducible from run_all.sh
 results/*.csv
 results/raw/
+results/smoke/
 logs/
 *.log
 

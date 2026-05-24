@@ -29,7 +29,18 @@ docker build -t kmfp .                              # 20-40 min first time
 docker run --gpus all -it --rm kmfp python smoke_test.py
 ```
 
-Expected: `Summary: 13/13 passed` (takes ~2–3 min — the last check actually runs MBPO for ~500 env steps to verify the full pipeline end-to-end).
+Expected: `Summary: 14/14 passed` (takes ~2–3 min). The last two checks actually run SAC and MBPO for short Pendulum runs (~2000 and ~500 env steps) so the full pipeline is verified end-to-end.
+
+Smoke-test eval values are saved to `results/smoke/`:
+```
+results/smoke/sac__Pendulum-v1__seed0.csv     # SAC training curve from smoke (~4 eval points)
+results/smoke/mbpo__Pendulum-v1__seed0.csv    # MBPO training curve from smoke (~3 eval points)
+```
+
+These are kept separate from full-benchmark results in `results/*.csv` so the two never overwrite each other. You can plot the smoke-run curves to verify the eval values look reasonable before kicking off the long sweep:
+```bash
+python -m runners.plot_results --results-dir results/smoke --out-dir plots/smoke
+```
 
 Then run the whole benchmark (~60 hours on a single 2080 Ti at the full-benchmark budget; see `run_all.sh` for per-cell breakdown):
 

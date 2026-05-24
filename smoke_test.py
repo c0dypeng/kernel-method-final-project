@@ -15,6 +15,7 @@ from __future__ import annotations
 import os
 import sys
 import traceback
+from pathlib import Path
 
 RESULTS = []
 
@@ -167,43 +168,72 @@ def _():
     assert out is not None
 
 
-@check("MBPO end-to-end: runs run_mbpo on Pendulum for ~500 env steps")
+# Smoke-test eval outputs live in results/smoke/ — kept separate from the
+# full-benchmark `results/*.csv` so the two never overwrite each other and
+# both can produce training curves.
+SMOKE_RESULTS_DIR = Path("results") / "smoke"
+
+
+@check("SAC end-to-end: trains for 2000 Pendulum env steps, saves CSV")
 def _():
-    """Verifies the full MBPO pipeline (dynamics model + SAC inner loop +
-    eval callback + unified CSV) runs without crashing. ~30-60 sec on GPU."""
+    """Verifies SAC pipeline + unified CSV emission. Saves to results/smoke/
+    so the eval values persist (teammate request: 紀錄evaluation的數值 so
+    we can draw training curves from smoke runs too)."""
     import os
     import subprocess
-    import tempfile
-    from pathlib import Path
 
-    with tempfile.TemporaryDirectory() as tmp:
-        cmd = [
-            "python", "-m", "runners.run_mbpo",
-            "--env", "Pendulum-v1",
-            "--steps", "500",
-            "--seed", "0",
-            "--results-dir", tmp,
-            "--eval-freq", "200",
-            "--n-eval-episodes", "1",
-        ]
-        env = os.environ.copy()
-        env.setdefault("CUDA_VISIBLE_DEVICES", "0")
-        result = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=600,
-            env=env,
-        )
-        if result.returncode != 0:
-            # surface the tail so the failure is actionable
-            tail = "\n".join(result.stderr.splitlines()[-30:])
-            raise RuntimeError(
-                f"run_mbpo exited {result.returncode}\nstderr tail:\n{tail}"
-            )
-        csv_path = Path(tmp) / "mbpo__Pendulum-v1__seed0.csv"
-        assert csv_path.exists(), f"missing CSV at {csv_path}"
-        lines = csv_path.read_text().splitlines()
-        assert len(lines) >= 2, f"CSV has no eval rows: {lines}"
-        # header + at least one eval row
-        assert lines[0].startswith("env_steps"), f"bad header: {lines[0]}"
+    SMOKE_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    cmd = [
+        "python", "-m", "runners.run_sac",
+        "--env", "Pendulum-v1",
+        "--steps", "2000",
+        "--seed", "0",
+        "--results-dir", str(SMOKE_RESULTS_DIR),
+        "--eval-freq", "500",
+        "--n-eval-episodes", "2",
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+    if result.returncode != 0:
+        tail = "\n".join(result.stderr.splitlines()[-30:])
+        raise RuntimeError(f"run_sac exited {result.returncode}\nstderr tail:\n{tail}")
+    csv_path = SMOKE_RESULTS_DIR / "sac__Pendulum-v1__seed0.csv"
+    assert csv_path.exists(), f"missing CSV at {csv_path}"
+    lines = csv_path.read_text().splitlines()
+    assert len(lines) >= 3, f"CSV has too few eval rows ({len(lines)-1}): {lines}"
+    assert lines[0].startswith("env_steps"), f"bad header: {lines[0]}"
+    print(f"    info: {len(lines)-1} eval rows saved to {csv_path}")
+
+
+@check("MBPO end-to-end: trains for ~500 Pendulum env steps, saves CSV")
+def _():
+    """Verifies the full MBPO pipeline (dynamics model + SAC inner loop +
+    eval callback + unified CSV) runs without crashing. ~30-60 sec on GPU.
+    Output saved to results/smoke/ for training-curve inspection."""
+    import os
+    import subprocess
+
+    SMOKE_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    cmd = [
+        "python", "-m", "runners.run_mbpo",
+        "--env", "Pendulum-v1",
+        "--steps", "500",
+        "--seed", "0",
+        "--results-dir", str(SMOKE_RESULTS_DIR),
+        "--eval-freq", "200",
+        "--n-eval-episodes", "1",
+    ]
+    env = os.environ.copy()
+    env.setdefault("CUDA_VISIBLE_DEVICES", "0")
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=600, env=env)
+    if result.returncode != 0:
+        tail = "\n".join(result.stderr.splitlines()[-30:])
+        raise RuntimeError(f"run_mbpo exited {result.returncode}\nstderr tail:\n{tail}")
+    csv_path = SMOKE_RESULTS_DIR / "mbpo__Pendulum-v1__seed0.csv"
+    assert csv_path.exists(), f"missing CSV at {csv_path}"
+    lines = csv_path.read_text().splitlines()
+    assert len(lines) >= 2, f"CSV has no eval rows: {lines}"
+    assert lines[0].startswith("env_steps"), f"bad header: {lines[0]}"
+    print(f"    info: {len(lines)-1} eval rows saved to {csv_path}")
 
 
 @check("PILCO trains on tiny synthetic data (1 GP + 1 policy iter)")
