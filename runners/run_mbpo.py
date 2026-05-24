@@ -138,13 +138,21 @@ def build_cfg(env_id: str, total_steps: int, seed: int, device: str, work_dir: s
         "sac_batch_size": 256,
     }
 
+    # NB: mbrl-lib's hydra YAML uses ${overrides.sac_xxx} interpolation
+    # strings, but those only resolve when hydra builds the whole config
+    # tree at once. When we construct the OmegaConf programmatically and
+    # mbrl reads cfg.algorithm.agent.args.gamma via hydra.utils.instantiate,
+    # the interpolation triggers and OmegaConf 2.1.2 raises
+    # InterpolationKeyError because the parent context isn't set the way
+    # hydra would set it. Inline the values from the `overrides` dict
+    # directly — same effect, no resolution path required.
     algorithm = {
         "name": "mbpo",
         "normalize": True,
         "normalize_double_precision": True,
         "target_is_delta": True,
         "learned_rewards": True,
-        "freq_train_model": "${overrides.freq_train_model}",
+        "freq_train_model": overrides["freq_train_model"],
         "real_data_ratio": 0.0,
         "sac_samples_action": True,
         "initial_exploration_steps": 5000,
@@ -152,24 +160,24 @@ def build_cfg(env_id: str, total_steps: int, seed: int, device: str, work_dir: s
         "num_eval_episodes": 1,
         "agent": {
             "_target_": "mbrl.third_party.pytorch_sac_pranz24.sac.SAC",
-            "num_inputs": "???",
+            "num_inputs": "???",  # filled in by mbrl after env is known
             "action_space": {
                 "_target_": "gym.spaces.Box",
-                "low": "???",
+                "low": "???",     # filled in by mbrl
                 "high": "???",
                 "shape": "???",
             },
             "args": {
-                "gamma": "${overrides.sac_gamma}",
-                "tau": "${overrides.sac_tau}",
-                "alpha": "${overrides.sac_alpha}",
-                "policy": "${overrides.sac_policy}",
-                "target_update_interval": "${overrides.sac_target_update_interval}",
-                "automatic_entropy_tuning": "${overrides.sac_automatic_entropy_tuning}",
-                "target_entropy": "${overrides.sac_target_entropy}",
-                "hidden_size": "${overrides.sac_hidden_size}",
-                "device": "${device}",
-                "lr": "${overrides.sac_lr}",
+                "gamma": overrides["sac_gamma"],
+                "tau": overrides["sac_tau"],
+                "alpha": overrides["sac_alpha"],
+                "policy": overrides["sac_policy"],
+                "target_update_interval": overrides["sac_target_update_interval"],
+                "automatic_entropy_tuning": overrides["sac_automatic_entropy_tuning"],
+                "target_entropy": overrides["sac_target_entropy"],
+                "hidden_size": overrides["sac_hidden_size"],
+                "device": device,
+                "lr": overrides["sac_lr"],
             },
         },
     }
