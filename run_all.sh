@@ -17,15 +17,21 @@
 
 set -euo pipefail
 
-ALGOS=${ALGOS:-"sac mbpo pilco"}
+# NB: outer loop is SEEDS, inner loop is ALGOS. This way if the run gets
+# interrupted you have *complete seeds* (good for plotting partial results)
+# rather than complete algorithms-but-only-on-some-seeds. Order within each
+# seed is PILCO -> SAC -> MBPO: PILCO first because it's the riskiest
+# (most likely to crash on HalfCheetah), SAC second as the baseline that
+# always works, MBPO last as the heaviest cell.
+ALGOS=${ALGOS:-"pilco sac mbpo"}
 ENVS=${ENVS:-"Pendulum-v1 HalfCheetah-v4"}
 SEEDS=${SEEDS:-"0 1 2"}
 
 mkdir -p results plots logs
 
-for algo in $ALGOS; do
+for seed in $SEEDS; do
   for env in $ENVS; do
-    for seed in $SEEDS; do
+    for algo in $ALGOS; do
       tag="${algo}__${env}__seed${seed}"
       echo
       echo "===================================================================="
