@@ -8,10 +8,10 @@ A controlled comparison of three reinforcement learning algorithms across two co
 | **MBPO** (Janner et al. 2019) | Model-based | Ensemble of dynamics models + short imagined rollouts feeding SAC | [facebookresearch/mbrl-lib](https://github.com/facebookresearch/mbrl-lib) |
 | **PILCO** (Deisenroth, Fox & Rasmussen 2015) | Model-based, Bayesian | GP dynamics + analytic policy gradients via moment matching | [c0dypeng/PILCO-modern](https://github.com/c0dypeng/PILCO-modern) |
 
-| Environment | obs / act dim | Why we picked it |
-|---|---|---|
-| `Pendulum-v1` | 3 / 1 | Low-dim, PILCO's home turf, fast to train |
-| `HalfCheetah-v4` | 17 / 6 | MBPO/SAC benchmark, PILCO is expected to fail here |
+| Environment | obs / act dim | Budget | Why we picked it |
+|---|---|---|---|
+| `Pendulum-v1` | 3 / 1 | 100K env steps | Low-dim, PILCO's home turf, fast to train |
+| `HalfCheetah-v4` | 17 / 6 | 1M env steps | MBPO/SAC benchmark, PILCO is expected to fail here |
 
 ## Expected results (qualitative — actual numbers from your runs go in `plots/`)
 
@@ -29,9 +29,9 @@ docker build -t kmfp .                              # 20-40 min first time
 docker run --gpus all -it --rm kmfp python smoke_test.py
 ```
 
-Expected: `Summary: 12/12 passed`.
+Expected: `Summary: 13/13 passed` (takes ~2–3 min — the last check actually runs MBPO for ~500 env steps to verify the full pipeline end-to-end).
 
-Then run the whole benchmark (~13 hours on a single 2080 Ti — see `run_all.sh` for breakdown):
+Then run the whole benchmark (~60 hours on a single 2080 Ti at the full-benchmark budget; see `run_all.sh` for per-cell breakdown):
 
 ```bash
 docker run --gpus all -it --rm -v "$(pwd)":/workspace kmfp ./run_all.sh

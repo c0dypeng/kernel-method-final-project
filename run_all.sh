@@ -1,14 +1,16 @@
 #!/usr/bin/env bash
 # Orchestration script: runs all (algo, env, seed) combinations sequentially.
 # Total: 3 algos x 2 envs x 3 seeds = 18 runs.
+# Full benchmark budget: Pendulum 100K env steps, HalfCheetah 1M env steps.
 # Expected wallclock on a single RTX 2080 Ti:
-#   SAC Pendulum (50K)        ~5  min/seed   x 3 = 15 min
-#   SAC HalfCheetah (200K)    ~30 min/seed   x 3 = 90 min
-#   MBPO Pendulum (50K)       ~30 min/seed   x 3 = 90 min   <- model+SAC inner loop is heavy
-#   MBPO HalfCheetah (200K)   ~3 hr/seed     x 3 = 9 hr
-#   PILCO Pendulum (8 iter)   ~10 min/seed   x 3 = 30 min
-#   PILCO HalfCheetah (5 iter, sparse, expected fail) ~20 min/seed x 3 = 60 min
-# Grand total: ~13 hr. Run overnight.
+#   SAC Pendulum (100K)        ~10 min/seed   x 3 = 30 min
+#   SAC HalfCheetah (1M)       ~2.5 hr/seed   x 3 = 7.5 hr
+#   MBPO Pendulum (100K)       ~1 hr/seed     x 3 = 3 hr     <- model+SAC inner loop is heavy
+#   MBPO HalfCheetah (1M)      ~15 hr/seed    x 3 = 45 hr    <- the long pole
+#   PILCO Pendulum (10 iter)   ~15 min/seed   x 3 = 45 min
+#   PILCO HalfCheetah (8 iter, sparse, expected fail) ~30 min/seed x 3 = 90 min
+# Grand total: ~60 hr. Plan for ~3 days of wall time on a single GPU, or
+# parallelize across two GPUs (see README "Two-GPU tip") to cut roughly in half.
 #
 # To run a subset, set ALGOS, ENVS, or SEEDS env vars:
 #   ALGOS="sac pilco" SEEDS="0 1" ./run_all.sh
@@ -31,8 +33,8 @@ for algo in $ALGOS; do
       echo "===================================================================="
 
       case "$env" in
-        Pendulum-v1)    sac_steps=50000;  mbpo_steps=50000;  pilco_iter=8 ;;
-        HalfCheetah-v4) sac_steps=200000; mbpo_steps=200000; pilco_iter=5 ;;
+        Pendulum-v1)    sac_steps=100000;  mbpo_steps=100000;  pilco_iter=10 ;;
+        HalfCheetah-v4) sac_steps=1000000; mbpo_steps=1000000; pilco_iter=8 ;;
         *) echo "unknown env $env" >&2; exit 1 ;;
       esac
 

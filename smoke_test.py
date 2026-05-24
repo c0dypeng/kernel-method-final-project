@@ -167,6 +167,45 @@ def _():
     assert out is not None
 
 
+@check("MBPO end-to-end: runs run_mbpo on Pendulum for ~500 env steps")
+def _():
+    """Verifies the full MBPO pipeline (dynamics model + SAC inner loop +
+    eval callback + unified CSV) runs without crashing. ~30-60 sec on GPU."""
+    import os
+    import subprocess
+    import tempfile
+    from pathlib import Path
+
+    with tempfile.TemporaryDirectory() as tmp:
+        cmd = [
+            "python", "-m", "runners.run_mbpo",
+            "--env", "Pendulum-v1",
+            "--steps", "500",
+            "--seed", "0",
+            "--results-dir", tmp,
+            "--eval-freq", "200",
+            "--n-eval-episodes", "1",
+        ]
+        env = os.environ.copy()
+        env.setdefault("CUDA_VISIBLE_DEVICES", "0")
+        result = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=600,
+            env=env,
+        )
+        if result.returncode != 0:
+            # surface the tail so the failure is actionable
+            tail = "\n".join(result.stderr.splitlines()[-30:])
+            raise RuntimeError(
+                f"run_mbpo exited {result.returncode}\nstderr tail:\n{tail}"
+            )
+        csv_path = Path(tmp) / "mbpo__Pendulum-v1__seed0.csv"
+        assert csv_path.exists(), f"missing CSV at {csv_path}"
+        lines = csv_path.read_text().splitlines()
+        assert len(lines) >= 2, f"CSV has no eval rows: {lines}"
+        # header + at least one eval row
+        assert lines[0].startswith("env_steps"), f"bad header: {lines[0]}"
+
+
 @check("PILCO trains on tiny synthetic data (1 GP + 1 policy iter)")
 def _():
     import numpy as np
