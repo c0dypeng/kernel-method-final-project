@@ -1,0 +1,250 @@
+"""PILCO runner using the algorithm code from c0dypeng/PILCO-modern.
+
+PILCO learns from a tiny replay buffer (the GP becomes O(N^3) so N stays small).
+Eval protocol: between PILCO iterations, evaluate the deterministic policy on
+`n_eval_episodes` real-env rollouts and log to the unified CSV.
+
+For HalfCheetah we use the sparse GP variant (SMGPR) because dense GPs explode
+at >300 transitions. This is **expected to fail** on cheetah — the original
+PILCO authors never claimed it works on 17D+6D systems. We run it anyway to
+document the data-efficiency / scalability tradeoff that motivates MBPO.
+
+Usage:
+    python -m runners.run_pilco --env Pendulum-v1   --iterations 8  --seed 0
+    python -m runners.run_pilco --env HalfCheetah-v4 --iterations 5 --seed 0
+"""
+from __future__ import annotations
+
+import argparse
+import time
+from pathlib import Path
+
+import numpy as np
+import tensorflow as tf
+import gymnasium as gym
+
+from runners.common import EvalLogger, evaluate_policy, env_factory_for
+
+
+# ---------------------------------------------------------------------------
+# Suppress TF chatter so the eval log stays readable.
+# ---------------------------------------------------------------------------
+tf.get_logger().setLevel("ERROR")
+import os
+os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
+
+
+# ---------------------------------------------------------------------------
+# Per-env PILCO hyperparams.
+# Pendulum-v1: 3-dim obs (cos/sin/dot), 1-dim continuous torque [-2, 2].
+# HalfCheetah-v4: 17-dim obs, 6-dim action [-1, 1]. Expected failure mode.
+# ---------------------------------------------------------------------------
+ENV_CONFIGS = {
+    "Pendulum-v1": dict(
+        max_action=2.0,
+        horizon=40,
+        num_basis_functions=30,
+        sparse=False,
+        num_induced_points=None,
+        initial_random_rollouts=4,
+        timesteps_per_rollout=40,
+        subsampling=1,
+        likelihood_var=0.001,
+    ),
+    "HalfCheetah-v4": dict(
+        max_action=1.0,
+        horizon=15,
+        num_basis_functions=40,
+        sparse=True,
+        num_induced_points=100,
+        initial_random_rollouts=3,
+        timesteps_per_rollout=25,
+        subsampling=1,
+        likelihood_var=0.01,
+    ),
+}
+
+
+def env_obs_act_dims(env_id: str) -> tuple[int, int]:
+    env = gym.make(env_id)
+    obs_dim = int(np.prod(env.observation_space.shape))
+    act_dim = int(np.prod(env.action_space.shape))
+    env.close()
+    return obs_dim, act_dim
+
+
+def rollout_real_env(env, pilco_or_none, timesteps: int, subsampling: int,
+                    random_policy: bool, max_action: float, action_dim: int,
+                    seed: int | None = None):
+    """Roll out one episode in the real env, returning (X, Y, cumulative_reward, n_steps).
+
+    X has shape (T, obs_dim + act_dim), Y has shape (T, obs_dim) with Y_t = x_{t+1} - x_t.
+    """
+    if seed is not None:
+        obs, _ = env.reset(seed=seed)
+    else:
+        obs, _ = env.reset()
+    obs = np.asarray(obs, dtype=np.float64)
+
+    X, Y = [], []
+    ep_return = 0.0
+    n_steps = 0
+    for _ in range(timesteps):
+        if random_policy or pilco_or_none is None:
+            action = env.action_space.sample()
+        else:
+            action = pilco_or_none.compute_action(obs[None, :])[0].numpy()
+            action = np.clip(action, -max_action, max_action)
+        action = np.asarray(action, dtype=np.float64).reshape(action_dim)
+
+        next_obs = obs
+        for _sub in range(subsampling):
+            step_out = env.step(action.astype(np.float32))
+            if len(step_out) == 5:
+                next_obs, r, terminated, truncated, _ = step_out
+                done = terminated or truncated
+            else:
+                next_obs, r, done, _ = step_out
+            next_obs = np.asarray(next_obs, dtype=np.float64)
+            ep_return += float(r)
+            n_steps += 1
+            if done:
+                break
+
+        X.append(np.hstack([obs, action]))
+        Y.append(next_obs - obs)
+        obs = next_obs
+        if done:
+            break
+    return np.asarray(X), np.asarray(Y), ep_return, n_steps
+
+
+def build_pilco(X, Y, cfg, state_dim, control_dim):
+    from pilco.models import PILCO
+    from pilco.controllers import RbfController
+    from pilco.rewards import ExponentialReward
+    from gpflow import set_trainable
+
+    controller = RbfController(
+        state_dim=state_dim,
+        control_dim=control_dim,
+        num_basis_functions=cfg["num_basis_functions"],
+        max_action=cfg["max_action"],
+    )
+    # Generic squared-distance reward around the origin — works as a proxy for
+    # the true environment reward (the PILCO predicted reward is *not* the
+    # quantity we're benchmarking; we benchmark real-env returns).
+    reward = ExponentialReward(state_dim=state_dim)
+
+    pilco = PILCO(
+        (X, Y),
+        num_induced_points=cfg["num_induced_points"] if cfg["sparse"] else None,
+        controller=controller,
+        horizon=cfg["horizon"],
+        reward=reward,
+        m_init=np.zeros((1, state_dim)),
+        S_init=0.1 * np.eye(state_dim),
+    )
+
+    # Numerical-stability trick from the PILCO examples + the paper (§5.3.2).
+    for model in pilco.mgpr.models:
+        model.likelihood.variance.assign(cfg["likelihood_var"])
+        set_trainable(model.likelihood.variance, False)
+    return pilco
+
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser()
+    p.add_argument("--env", required=True, choices=["Pendulum-v1", "HalfCheetah-v4"])
+    p.add_argument("--iterations", type=int, default=8, help="PILCO outer iterations")
+    p.add_argument("--n-eval-episodes", type=int, default=3)
+    p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--results-dir", default="results")
+    return p.parse_args()
+
+
+def main():
+    args = parse_args()
+    cfg = ENV_CONFIGS[args.env]
+    print(f"[pilco] env={args.env} iterations={args.iterations} seed={args.seed} sparse={cfg['sparse']}")
+
+    np.random.seed(args.seed)
+    tf.random.set_seed(args.seed)
+
+    csv_path = Path(args.results_dir) / f"pilco__{args.env}__seed{args.seed}.csv"
+    logger = EvalLogger.open(csv_path)
+
+    obs_dim, act_dim = env_obs_act_dims(args.env)
+    env = gym.make(args.env)
+    env.action_space.seed(args.seed)
+
+    # --- Initial random rollouts ---
+    print(f"[pilco] collecting {cfg['initial_random_rollouts']} random rollouts "
+          f"({cfg['timesteps_per_rollout']} steps each)")
+    X, Y = None, None
+    total_env_steps = 0
+    for j in range(cfg["initial_random_rollouts"]):
+        Xi, Yi, _, n = rollout_real_env(
+            env, None, cfg["timesteps_per_rollout"], cfg["subsampling"],
+            random_policy=True, max_action=cfg["max_action"], action_dim=act_dim,
+            seed=args.seed + j,
+        )
+        total_env_steps += n
+        X = Xi if X is None else np.vstack([X, Xi])
+        Y = Yi if Y is None else np.vstack([Y, Yi])
+
+    # --- Build PILCO and evaluate the *random* policy as a baseline ---
+    pilco = build_pilco(X, Y, cfg, state_dim=obs_dim, control_dim=act_dim)
+
+    def act_fn(obs):
+        return pilco.compute_action(np.asarray(obs, dtype=np.float64)[None, :])[0].numpy()
+
+    mean_r, std_r = evaluate_policy(
+        env_factory_for(args.env), act_fn,
+        n_eval_episodes=args.n_eval_episodes, seed=20_000 + args.seed,
+    )
+    logger.log(total_env_steps, mean_r, std_r)
+
+    # --- PILCO main loop ---
+    for it in range(args.iterations):
+        print(f"\n[pilco] **** ITERATION {it+1}/{args.iterations} **** "
+              f"(data: {X.shape[0]} transitions, env_steps={total_env_steps})")
+
+        t0 = time.time()
+        try:
+            pilco.optimize_models(maxiter=80, restarts=1)
+        except Exception as e:
+            print(f"[pilco] optimize_models failed: {type(e).__name__}: {e}")
+        try:
+            pilco.optimize_policy(maxiter=40, restarts=1)
+        except Exception as e:
+            print(f"[pilco] optimize_policy failed: {type(e).__name__}: {e}")
+        print(f"[pilco] optimization wall time: {time.time()-t0:.1f}s")
+
+        # Real-env rollout under the learned policy — appended to the dataset.
+        Xn, Yn, ep_return, n = rollout_real_env(
+            env, pilco, cfg["timesteps_per_rollout"], cfg["subsampling"],
+            random_policy=False, max_action=cfg["max_action"], action_dim=act_dim,
+            seed=args.seed + 1000 + it,
+        )
+        total_env_steps += n
+        X = np.vstack([X, Xn])
+        Y = np.vstack([Y, Yn])
+        try:
+            pilco.mgpr.set_data((X, Y))
+        except Exception as e:
+            print(f"[pilco] set_data failed: {type(e).__name__}: {e}")
+
+        # Evaluate.
+        mean_r, std_r = evaluate_policy(
+            env_factory_for(args.env), act_fn,
+            n_eval_episodes=args.n_eval_episodes, seed=20_000 + args.seed,
+        )
+        logger.log(total_env_steps, mean_r, std_r)
+
+    env.close()
+    print(f"\n[pilco] done -> {csv_path}")
+
+
+if __name__ == "__main__":
+    main()

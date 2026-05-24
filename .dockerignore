@@ -1,0 +1,12 @@
+.git
+.gitignore
+__pycache__
+**/__pycache__
+*.pyc
+.venv
+venv
+.pytest_cache
+*.egg-info
+logs/
+results/raw/
+*.log

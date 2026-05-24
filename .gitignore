@@ -1,0 +1,24 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.egg
+.venv/
+venv/
+.pytest_cache/
+.DS_Store
+.idea/
+.vscode/
+
+# experiment outputs — large and reproducible from run_all.sh
+results/*.csv
+results/raw/
+logs/
+*.log
+
+# but DO commit plots
+!plots/
+plots/*.png
+plots/summary.csv
+
+# editor swap
+*.swp
