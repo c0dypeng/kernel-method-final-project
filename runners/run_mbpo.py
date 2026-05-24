@@ -158,15 +158,12 @@ def build_cfg(env_id: str, total_steps: int, seed: int, device: str, work_dir: s
         "initial_exploration_steps": 5000,
         "random_initial_explore": False,
         "num_eval_episodes": 1,
+        # NB: no _target_ / num_inputs / action_space here. We construct the
+        # SAC agent directly in train_mbpo_with_eval() to bypass hydra's
+        # OmegaConf -> ListConfig round-trip which corrupts the Box space.
+        # Only `args` is carried in the config so the SAC hyperparams are
+        # still accessible via cfg.algorithm.agent.args.<name>.
         "agent": {
-            "_target_": "mbrl.third_party.pytorch_sac_pranz24.sac.SAC",
-            "num_inputs": "???",  # filled in by mbrl after env is known
-            "action_space": {
-                "_target_": "gym.spaces.Box",
-                "low": "???",     # filled in by mbrl
-                "high": "???",
-                "shape": "???",
-            },
             "args": {
                 "gamma": overrides["sac_gamma"],
                 "tau": overrides["sac_tau"],
@@ -230,20 +227,26 @@ def train_mbpo_with_eval(env, cfg: DictConfig, eval_callback,
         replay_buffer=replay_buffer,
     )
 
-    # SAC agent
-    complete_agent_cfg = OmegaConf.to_container(cfg.algorithm.agent, resolve=False)
-    complete_agent_cfg["num_inputs"] = obs_shape[0]
-    complete_agent_cfg["action_space"] = {
-        "_target_": "gym.spaces.Box",
-        "low": env.action_space.low.tolist(),
-        "high": env.action_space.high.tolist(),
-        "shape": list(act_shape),
-    }
-    complete_agent_cfg = OmegaConf.create(complete_agent_cfg)
-    OmegaConf.resolve(cfg)  # resolve interpolations before instantiation
-
-    import hydra.utils
-    agent = hydra.utils.instantiate(complete_agent_cfg)
+    # SAC agent — bypass hydra.utils.instantiate entirely.
+    #
+    # mbrl-lib's stock approach is `hydra.utils.instantiate(cfg.algorithm.agent)`
+    # which then recursively instantiates the nested action_space sub-config
+    # as `gym.spaces.Box(low=..., high=..., shape=...)`. But OmegaConf turns
+    # plain Python lists into ListConfig objects during round-trip, and
+    # `gym.spaces.Box.__init__` does `low < high` element-wise comparisons
+    # that crash with TypeError on ListConfig values.
+    #
+    # Easier: import the SAC class directly and construct it with the real
+    # env.action_space (which is already a valid Space). The `args` parameter
+    # just needs attribute access for gamma/tau/etc., which OmegaConf
+    # provides natively.
+    from mbrl.third_party.pytorch_sac_pranz24.sac import SAC as _SACAgent
+    sac_args = cfg.algorithm.agent.args  # OmegaConf DictConfig, attribute access works
+    agent = _SACAgent(
+        num_inputs=obs_shape[0],
+        action_space=env.action_space,
+        args=sac_args,
+    )
 
     model_env = mbrl.models.ModelEnv(
         env, dynamics_model, no_termination_fn,
