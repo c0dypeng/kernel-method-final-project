@@ -49,11 +49,13 @@ RUN pip install \
 RUN pip install hydra-core==1.1.2 omegaconf==2.1.2 && \
     pip install --no-deps mbrl==0.2.0 && \
     pip install \
+        tqdm \
         termcolor \
         colorlog \
         tensorboardX \
         scikit-learn \
-        pytest
+        pytest \
+        imageio
 
 # ---- Stage 4: PILCO stack (TF 2.15 + GPflow 2.9) ----
 # TF and PyTorch coexist fine; both pull their own CUDA runtime wheels.
@@ -73,6 +75,18 @@ COPY . /workspace/
 RUN pip install -e /workspace/pilco_src
 
 # ---- Smoke import to fail the build fast on any broken pin ----
-RUN python -c "import torch; import stable_baselines3; import mbrl; import tensorflow as tf; import gpflow; import gymnasium as gym; import mujoco; print('all imports ok'); print('torch', torch.__version__, '| sb3', stable_baselines3.__version__, '| mbrl', mbrl.__version__, '| tf', tf.__version__, '| gpflow', gpflow.__version__, '| gym', gym.__version__, '| mujoco', mujoco.__version__)"
+# Covers all the import paths the runners actually use, not just the top-level packages.
+# Adding mbrl.algorithms.mbpo here is what catches missing transitive deps like tqdm.
+RUN python -c "\
+import torch, stable_baselines3, mbrl, tensorflow as tf, gpflow, gymnasium as gym, mujoco; \
+import tensorflow_probability, omegaconf, hydra, tqdm; \
+import mbrl.algorithms.mbpo, mbrl.util.common, mbrl.models; \
+from mbrl.models import GaussianMLP; \
+from pilco.models import PILCO; \
+from pilco.controllers import RbfController; \
+from pilco.rewards import ExponentialReward; \
+print('all imports ok'); \
+print('torch', torch.__version__, '| sb3', stable_baselines3.__version__, '| mbrl', mbrl.__version__, '| tf', tf.__version__, '| gpflow', gpflow.__version__, '| gym', gym.__version__, '| mujoco', mujoco.__version__)\
+"
 
 CMD ["bash"]

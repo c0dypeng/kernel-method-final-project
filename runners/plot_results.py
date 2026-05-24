@@ -54,13 +54,17 @@ def aggregate(results_dir: Path):
 
 
 def common_grid(seed_runs, n_points=50):
-    """Resample (xs, ys) onto a common evenly-spaced env_steps grid via linear interp."""
+    """Resample (xs, ys) onto a common evenly-spaced env_steps grid via linear interp.
+
+    Use NaN outside each seed's actual data range — so a short-running seed
+    doesn't drag the mean/band on the right via np.interp's default clamping.
+    """
     all_max = max(xs[-1] for xs, _, _ in seed_runs)
     all_min = max(xs[0] for xs, _, _ in seed_runs)  # latest "first" point across seeds
     grid = np.linspace(all_min, all_max, n_points)
-    Y = np.empty((len(seed_runs), n_points))
+    Y = np.full((len(seed_runs), n_points), np.nan)
     for i, (xs, ys, _) in enumerate(seed_runs):
-        Y[i] = np.interp(grid, xs, ys)
+        Y[i] = np.interp(grid, xs, ys, left=np.nan, right=np.nan)
     return grid, Y
 
 
@@ -69,23 +73,31 @@ LABELS = {"sac": "SAC", "mbpo": "MBPO", "pilco": "PILCO"}
 
 
 def plot_env(env: str, algo_runs: dict[str, list], out_path: Path):
-    fig, ax = plt.subplots(figsize=(8, 5))
+    # PILCO produces ~200-500 env steps; SAC/MBPO go to 50K-200K. A linear
+    # x-axis squashes PILCO into a vertical line. Use log scale + nanmean/min/max.
+    fig, ax = plt.subplots(figsize=(9, 5))
     for algo in ("sac", "mbpo", "pilco"):
         runs = algo_runs.get(algo, [])
         if not runs:
             continue
         grid, Y = common_grid(runs)
-        mean = Y.mean(axis=0)
-        lo = Y.min(axis=0)
-        hi = Y.max(axis=0)
+        # Use nan-aware reductions so partial coverage doesn't poison the curve.
+        with np.errstate(all="ignore"):
+            mean = np.nanmean(Y, axis=0)
+            lo = np.nanmin(Y, axis=0)
+            hi = np.nanmax(Y, axis=0)
+        valid = ~np.isnan(mean)
         n = len(runs)
-        ax.plot(grid, mean, label=f"{LABELS[algo]} (n={n})", color=COLORS[algo], lw=2)
-        ax.fill_between(grid, lo, hi, color=COLORS[algo], alpha=0.2)
+        ax.plot(grid[valid], mean[valid], label=f"{LABELS[algo]} (n={n})",
+                color=COLORS[algo], lw=2)
+        ax.fill_between(grid[valid], lo[valid], hi[valid],
+                        color=COLORS[algo], alpha=0.2)
 
-    ax.set_title(f"{env}: return vs environment steps")
-    ax.set_xlabel("environment steps")
+    ax.set_title(f"{env}: return vs environment steps (log x-axis)")
+    ax.set_xlabel("environment steps (log scale)")
     ax.set_ylabel("mean episode return (eval)")
-    ax.grid(True, alpha=0.3)
+    ax.set_xscale("log")
+    ax.grid(True, which="both", alpha=0.3)
     ax.legend(loc="best")
     fig.tight_layout()
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -110,22 +122,26 @@ def main():
         out_path = out_dir / f"{env.lower().replace('-', '_')}_comparison.png"
         plot_env(env, algo_runs, out_path)
 
-    # Also write a summary table.
+    # Summary table — mean of the LAST 3 evals per seed, which is more robust
+    # than a single end-of-run point (especially for PILCO where the final
+    # iteration can spike due to numerical issues in the GP optimization).
     summary_path = out_dir / "summary.csv"
     out_dir.mkdir(parents=True, exist_ok=True)
+    K = 3
     with open(summary_path, "w", newline="") as f:
         w = csv.writer(f)
-        w.writerow(["env", "algo", "n_seeds", "final_return_mean", "final_return_std"])
+        w.writerow(["env", "algo", "n_seeds", f"last{K}_return_mean", f"last{K}_return_std"])
         for env, algo_runs in sorted(grouped.items()):
             for algo in ("sac", "mbpo", "pilco"):
                 runs = algo_runs.get(algo, [])
                 if not runs:
                     continue
-                final_returns = np.asarray([ys[-1] for _, ys, _ in runs])
+                # Per seed: mean of the last K eval rows. Across seeds: mean ± std.
+                per_seed = np.asarray([ys[-K:].mean() for _, ys, _ in runs])
                 w.writerow([
                     env, algo, len(runs),
-                    f"{final_returns.mean():.2f}",
-                    f"{final_returns.std():.2f}",
+                    f"{per_seed.mean():.2f}",
+                    f"{per_seed.std():.2f}",
                 ])
     print(f"[plot] wrote {summary_path}")
 

@@ -78,12 +78,29 @@ PyTorch and TensorFlow each bring their own CUDA runtime wheels — no conflict.
 
 ## Evaluation protocol
 
-To make the algorithms directly comparable, every runner logs to the same CSV schema (`env_steps`, `mean_return`, `std_return`, `wallclock_s`) where:
+To make the algorithms directly comparable, **every runner uses the exact same evaluation function** (`evaluate_policy` in `runners/common.py`) and logs to the same CSV schema:
+
+```
+env_steps, mean_return, std_return, wallclock_s
+```
 
 - **env_steps** = cumulative real-environment transitions consumed (the universally-meaningful x-axis for sample efficiency).
-- **mean_return / std_return** = mean and std of episode returns from `n_eval_episodes` deterministic-policy rollouts in a fresh env (no exploration noise).
+- **mean_return / std_return** = mean and std of episode returns from `n_eval_episodes` deterministic-policy rollouts in a fresh env (no exploration noise). Default is 5 episodes per eval.
 
-For SAC the eval frequency is `total_steps/20`. For MBPO it's whatever cadence mbrl-lib uses internally, parsed from its CSV. For PILCO the eval happens once per outer iteration.
+Eval cadence:
+- **SAC**: every `total_steps/20` env steps (so 20 eval points per run).
+- **MBPO**: same — `total_steps/20`. The runner explicitly hooks into the MBPO inner loop to run an eval at fixed intervals (mbrl-lib's built-in CSV is only logged once per epoch with `num_eval_episodes=1`, which is too sparse and has no error bars; we override it).
+- **PILCO**: once per outer iteration (~10 evals total per run).
+
+This is what makes the training curves comparable — same metric, same number of eval episodes, same deterministic policy.
+
+### Plot axes
+
+Because PILCO learns from a tiny replay buffer (~200–500 env steps total) and SAC/MBPO need 50K–200K env steps, the x-axis spans 2–3 orders of magnitude across the three algorithms. The comparison plot uses a **log x-axis** so all three curves are readable in the same figure. Without the log axis, PILCO collapses to a single line pressed against the y-axis.
+
+### Summary table
+
+`plots/summary.csv` reports the **mean of the last 3 eval points** per seed (then mean ± std across seeds). This is more robust than a single end-of-run point — particularly for PILCO where the GP can produce spurious final-iteration spikes.
 
 ## Why PILCO is expected to fail on HalfCheetah
 
