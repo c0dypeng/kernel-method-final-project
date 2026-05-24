@@ -236,17 +236,21 @@ def train_mbpo_with_eval(env, cfg: DictConfig, eval_callback,
     # `gym.spaces.Box.__init__` does `low < high` element-wise comparisons
     # that crash with TypeError on ListConfig values.
     #
-    # Easier: import the SAC class directly and construct it with the real
-    # env.action_space (which is already a valid Space). The `args` parameter
-    # just needs attribute access for gamma/tau/etc., which OmegaConf
-    # provides natively.
-    from mbrl.third_party.pytorch_sac_pranz24.sac import SAC as _SACAgent
-    sac_args = cfg.algorithm.agent.args  # OmegaConf DictConfig, attribute access works
-    agent = _SACAgent(
+    # Build the SAC stack in two steps, exactly like mbrl-lib does internally:
+    #   1. pranz24's SAC implementation (the actual network + optimizer)
+    #   2. mbrl.planning.SACAgent wrapper that exposes the .act(obs, sample,
+    #      batched) API the rollout/inner loops call.
+    # Without step 2, agent.act(...) raises AttributeError because pranz24's
+    # raw SAC exposes .select_action(...), not .act(...).
+    from mbrl.third_party.pytorch_sac_pranz24.sac import SAC as _Pranz24SAC
+    from mbrl.planning.sac_wrapper import SACAgent as _MbrlSACAgent
+    sac_args = cfg.algorithm.agent.args  # OmegaConf DictConfig — attribute access works
+    pranz24_sac = _Pranz24SAC(
         num_inputs=obs_shape[0],
         action_space=env.action_space,
         args=sac_args,
     )
+    agent = _MbrlSACAgent(pranz24_sac)
 
     model_env = mbrl.models.ModelEnv(
         env, dynamics_model, no_termination_fn,
@@ -322,11 +326,20 @@ def train_mbpo_with_eval(env, cfg: DictConfig, eval_callback,
         env_steps += 1
 
         # ---- SAC updates ----
+        # update_parameters lives on the pranz24 SAC (the network + optimizer),
+        # not on the mbrl SACAgent wrapper. Reach through `agent.sac_agent`.
+        # `reverse_mask=True` matches what mbrl's own train() does — the
+        # ReplayBuffer's mask field stores "terminated" in mbrl 0.2.0, but
+        # pranz24's SAC expects "not terminated", so we flip it inside SAC.
         if (env_steps % cfg.overrides.sac_updates_every_steps == 0 and
                 len(sac_buffer) >= cfg.overrides.sac_batch_size):
-            for _ in range(cfg.overrides.num_sac_updates_per_step):
-                agent.update_parameters(
-                    sac_buffer, cfg.overrides.sac_batch_size, env_steps,
+            for sac_update_idx in range(cfg.overrides.num_sac_updates_per_step):
+                agent.sac_agent.update_parameters(
+                    sac_buffer,
+                    cfg.overrides.sac_batch_size,
+                    env_steps * cfg.overrides.num_sac_updates_per_step + sac_update_idx,
+                    logger=None,
+                    reverse_mask=True,
                 )
 
         if done:
