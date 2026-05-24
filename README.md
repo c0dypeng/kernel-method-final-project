@@ -29,15 +29,16 @@ docker build -t kmfp .                              # 20-40 min first time
 docker run --gpus all -it --rm kmfp python smoke_test.py
 ```
 
-Expected: `Summary: 14/14 passed` (takes ~2–3 min). The last two checks actually run SAC and MBPO for short Pendulum runs (~2000 and ~500 env steps) so the full pipeline is verified end-to-end.
+Expected: `Summary: 15/15 passed` (takes ~4–5 min). The last three checks actually run SAC, MBPO, and PILCO for short Pendulum runs so the full pipeline is verified end-to-end for all three algorithms.
 
 Smoke-test eval values are saved to `results/smoke/`:
 ```
-results/smoke/sac__Pendulum-v1__seed0.csv     # SAC training curve from smoke (~4 eval points)
-results/smoke/mbpo__Pendulum-v1__seed0.csv    # MBPO training curve from smoke (~3 eval points)
+results/smoke/sac__Pendulum-v1__seed0.csv     # SAC,   2000 env steps, ~4 eval points
+results/smoke/mbpo__Pendulum-v1__seed0.csv    # MBPO,   500 env steps, ~3 eval points
+results/smoke/pilco__Pendulum-v1__seed0.csv   # PILCO,   2 iterations, ~3 eval points
 ```
 
-These are kept separate from full-benchmark results in `results/*.csv` so the two never overwrite each other. You can plot the smoke-run curves to verify the eval values look reasonable before kicking off the long sweep:
+These are kept separate from full-benchmark results in `results/*.csv` so the two never overwrite each other. You can plot the smoke-run curves immediately after smoke passes (good for slide-ready figures if the full sweep isn't done yet):
 ```bash
 python -m runners.plot_results --results-dir results/smoke --out-dir plots/smoke
 ```

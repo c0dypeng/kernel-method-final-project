@@ -236,6 +236,39 @@ def _():
     print(f"    info: {len(lines)-1} eval rows saved to {csv_path}")
 
 
+@check("PILCO end-to-end: runs 2 iterations on Pendulum, saves CSV")
+def _():
+    """Verifies the full PILCO pipeline (GP fit + policy optimization +
+    real-env rollout + unified CSV) runs without crashing. ~1-2 min.
+    Output saved to results/smoke/ for training-curve inspection."""
+    import os
+    import subprocess
+
+    SMOKE_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    cmd = [
+        "python", "-m", "runners.run_pilco",
+        "--env", "Pendulum-v1",
+        "--iterations", "2",
+        "--seed", "0",
+        "--results-dir", str(SMOKE_RESULTS_DIR),
+        "--n-eval-episodes", "2",
+    ]
+    env = os.environ.copy()
+    env.setdefault("CUDA_VISIBLE_DEVICES", "0")
+    # PILCO's L-BFGS GP optimization is CPU-heavy; allow up to 5 min.
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=600, env=env)
+    if result.returncode != 0:
+        tail = "\n".join(result.stderr.splitlines()[-30:])
+        raise RuntimeError(f"run_pilco exited {result.returncode}\nstderr tail:\n{tail}")
+    csv_path = SMOKE_RESULTS_DIR / "pilco__Pendulum-v1__seed0.csv"
+    assert csv_path.exists(), f"missing CSV at {csv_path}"
+    lines = csv_path.read_text().splitlines()
+    # PILCO logs: 1 baseline eval (random policy) + 1 per iteration = 3 rows for 2 iter
+    assert len(lines) >= 3, f"CSV has too few eval rows ({len(lines)-1}): {lines}"
+    assert lines[0].startswith("env_steps"), f"bad header: {lines[0]}"
+    print(f"    info: {len(lines)-1} eval rows saved to {csv_path}")
+
+
 @check("PILCO trains on tiny synthetic data (1 GP + 1 policy iter)")
 def _():
     import numpy as np
