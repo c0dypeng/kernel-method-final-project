@@ -259,11 +259,15 @@ def main():
 
         t0 = time.time()
         try:
-            pilco.optimize_models(maxiter=80, restarts=1)
+            # restarts=2 matches nrontsis/PILCO's pendulum_swing_up.py defaults
+            # and the paper's emphasis on multi-restart policy optimization to
+            # escape local optima. (Note: PILCO.optimize_models silently
+            # ignores maxiter — upstream bug — but restarts is honored.)
+            pilco.optimize_models(maxiter=50, restarts=2)
         except Exception as e:
             print(f"[pilco] optimize_models failed: {type(e).__name__}: {e}")
         try:
-            pilco.optimize_policy(maxiter=40, restarts=1)
+            pilco.optimize_policy(maxiter=50, restarts=2)
         except Exception as e:
             print(f"[pilco] optimize_policy failed: {type(e).__name__}: {e}")
         print(f"[pilco] optimization wall time: {time.time()-t0:.1f}s")
