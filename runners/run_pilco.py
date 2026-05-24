@@ -48,8 +48,14 @@ ENV_CONFIGS = {
         num_induced_points=None,
         initial_random_rollouts=4,
         timesteps_per_rollout=40,
-        subsampling=1,
+        subsampling=3,
         likelihood_var=0.001,
+        # Pendulum-v1 obs is [cos(theta), sin(theta), theta_dot].
+        # Upright equilibrium: cos(theta)=1, sin(theta)=0, theta_dot=0.
+        # Following the PILCO-modern mountain_car pattern, use ExponentialReward
+        # with explicit target `t` and weighting `W` instead of defaults.
+        reward_target=np.array([1.0, 0.0, 0.0]),
+        reward_W=np.diag([2.0, 2.0, 0.3]),
     ),
     "HalfCheetah-v4": dict(
         max_action=1.0,
@@ -61,6 +67,15 @@ ENV_CONFIGS = {
         timesteps_per_rollout=25,
         subsampling=1,
         likelihood_var=0.01,
+        # HalfCheetah-v4 obs is 17-dim (rootz, rootangle, joints, ...). The
+        # task reward in gym is forward_velocity - ctrl_cost, which the
+        # saturating ExponentialReward(t, W) cost can't directly encode.
+        # We use a proxy: target index 8 (rootx velocity = forward speed)
+        # at a large positive value, weight only that dim. This is a known
+        # limitation of PILCO on locomotion envs and part of why the
+        # comparison documents PILCO failing here.
+        reward_target=np.concatenate([np.zeros(8), [5.0], np.zeros(8)]),
+        reward_W=np.diag(np.concatenate([np.zeros(8), [1.0], np.zeros(8)])),
     ),
 }
 
@@ -119,7 +134,7 @@ def rollout_real_env(env, pilco_or_none, timesteps: int, subsampling: int,
     return np.asarray(X), np.asarray(Y), ep_return, n_steps
 
 
-def build_pilco(X, Y, cfg, state_dim, control_dim):
+def build_pilco(X, Y, cfg, state_dim, control_dim, m_init, S_init):
     from pilco.models import PILCO
     from pilco.controllers import RbfController
     from pilco.rewards import ExponentialReward
@@ -131,10 +146,15 @@ def build_pilco(X, Y, cfg, state_dim, control_dim):
         num_basis_functions=cfg["num_basis_functions"],
         max_action=cfg["max_action"],
     )
-    # Generic squared-distance reward around the origin — works as a proxy for
-    # the true environment reward (the PILCO predicted reward is *not* the
-    # quantity we're benchmarking; we benchmark real-env returns).
-    reward = ExponentialReward(state_dim=state_dim)
+    # ExponentialReward with explicit target `t` and weighting `W` per env —
+    # matches the PILCO-modern mountain_car.py pattern. Defaults (t=0, W=I)
+    # would tell PILCO the goal is "drive every state to zero," which is not
+    # what either of our envs actually wants.
+    reward = ExponentialReward(
+        state_dim=state_dim,
+        t=cfg["reward_target"].reshape(1, state_dim),
+        W=cfg["reward_W"],
+    )
 
     pilco = PILCO(
         (X, Y),
@@ -142,8 +162,8 @@ def build_pilco(X, Y, cfg, state_dim, control_dim):
         controller=controller,
         horizon=cfg["horizon"],
         reward=reward,
-        m_init=np.zeros((1, state_dim)),
-        S_init=0.1 * np.eye(state_dim),
+        m_init=m_init,
+        S_init=S_init,
     )
 
     # Numerical-stability trick from the PILCO examples + the paper (§5.3.2).
@@ -183,6 +203,7 @@ def main():
           f"({cfg['timesteps_per_rollout']} steps each)")
     X, Y = None, None
     total_env_steps = 0
+    first_obs = None
     for j in range(cfg["initial_random_rollouts"]):
         Xi, Yi, _, n = rollout_real_env(
             env, None, cfg["timesteps_per_rollout"], cfg["subsampling"],
@@ -190,11 +211,22 @@ def main():
             seed=args.seed + j,
         )
         total_env_steps += n
+        if first_obs is None:
+            # First observation of the first rollout (state portion of X[0]).
+            first_obs = Xi[0, :obs_dim].copy()
         X = Xi if X is None else np.vstack([X, Xi])
         Y = Yi if Y is None else np.vstack([Y, Yi])
 
+    # PILCO start-state distribution. Mean = first observation seen during
+    # data collection (matches PILCO-modern mountain_car.py:31 pattern).
+    # Covariance: small but non-zero so the moment-matching has something to
+    # propagate. Same 0.1*I default as the example uses.
+    m_init = first_obs.reshape(1, obs_dim)
+    S_init = 0.1 * np.eye(obs_dim)
+
     # --- Build PILCO and evaluate the *random* policy as a baseline ---
-    pilco = build_pilco(X, Y, cfg, state_dim=obs_dim, control_dim=act_dim)
+    pilco = build_pilco(X, Y, cfg, state_dim=obs_dim, control_dim=act_dim,
+                        m_init=m_init, S_init=S_init)
 
     def act_fn(obs):
         return pilco.compute_action(np.asarray(obs, dtype=np.float64)[None, :])[0].numpy()
