@@ -52,10 +52,16 @@ ENV_CONFIGS = {
         likelihood_var=0.001,
         # Pendulum-v1 obs is [cos(theta), sin(theta), theta_dot].
         # Upright equilibrium: cos(theta)=1, sin(theta)=0, theta_dot=0.
-        # Following the PILCO-modern mountain_car pattern, use ExponentialReward
-        # with explicit target `t` and weighting `W` instead of defaults.
+        # Hanging-down equilibrium: cos(theta)=-1, sin(theta)=0, theta_dot=0.
+        # Matches PILCO-modern/examples/pendulum_swing_up.py:43-46 exactly.
         reward_target=np.array([1.0, 0.0, 0.0]),
         reward_W=np.diag([2.0, 2.0, 0.3]),
+        # Fixed start-state distribution: pole hanging straight down, at rest.
+        # This is what PILCO is "planning from"; using the first random-reset
+        # observation instead (random theta in [-pi, pi]) makes PILCO solve a
+        # different problem every seed. Matches pendulum_swing_up.py:45.
+        m_init_override=np.array([[-1.0, 0.0, 0.0]]),
+        S_init_override=np.diag([0.01, 0.05, 0.01]),
     ),
     "HalfCheetah-v4": dict(
         max_action=1.0,
@@ -76,6 +82,10 @@ ENV_CONFIGS = {
         # comparison documents PILCO failing here.
         reward_target=np.concatenate([np.zeros(8), [5.0], np.zeros(8)]),
         reward_W=np.diag(np.concatenate([np.zeros(8), [1.0], np.zeros(8)])),
+        # No fixed m_init for HalfCheetah — it's already roughly deterministic
+        # at the standing pose, so using the first-rollout observation is fine.
+        m_init_override=None,
+        S_init_override=None,
     ),
 }
 
@@ -217,12 +227,17 @@ def main():
         X = Xi if X is None else np.vstack([X, Xi])
         Y = Yi if Y is None else np.vstack([Y, Yi])
 
-    # PILCO start-state distribution. Mean = first observation seen during
-    # data collection (matches PILCO-modern mountain_car.py:31 pattern).
-    # Covariance: small but non-zero so the moment-matching has something to
-    # propagate. Same 0.1*I default as the example uses.
-    m_init = first_obs.reshape(1, obs_dim)
-    S_init = 0.1 * np.eye(obs_dim)
+    # PILCO start-state distribution.
+    # If the env config provides explicit overrides (Pendulum-v1 does — see
+    # pendulum_swing_up.py:45-46), use those. Otherwise fall back to the
+    # first-observation-of-first-rollout pattern from mountain_car.py:31,
+    # which works for near-deterministic-reset envs like HalfCheetah.
+    if cfg.get("m_init_override") is not None:
+        m_init = cfg["m_init_override"].astype(np.float64)
+        S_init = cfg["S_init_override"].astype(np.float64)
+    else:
+        m_init = first_obs.reshape(1, obs_dim)
+        S_init = 0.1 * np.eye(obs_dim)
 
     # --- Build PILCO and evaluate the *random* policy as a baseline ---
     pilco = build_pilco(X, Y, cfg, state_dim=obs_dim, control_dim=act_dim,

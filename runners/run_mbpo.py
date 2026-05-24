@@ -275,47 +275,27 @@ def train_mbpo_with_eval(env, cfg: DictConfig, eval_callback,
 
     print(f"[mbpo] starting main loop; total_steps={total_steps}, eval_every={eval_every}")
 
+    # Monotonic counter for SAC updates — used as the `updates` arg, matches
+    # mbrl-lib's behavior where this only increments when an update fires.
+    updates_made = 0
+
+    # Initial rollout length for epoch 0 (mbrl-lib uses 1-indexed epoch in
+    # the schedule lookup).
+    def _rollout_length_for_epoch(epoch_1_indexed: int) -> int:
+        min_ep, max_ep, min_len, max_len = cfg.overrides.rollout_schedule
+        e = epoch_1_indexed
+        if e <= min_ep:
+            return int(min_len)
+        if e >= max_ep:
+            return int(max_len)
+        return int(min_len + (e - min_ep) / (max_ep - min_ep) * (max_len - min_len))
+
+    rollout_length = _rollout_length_for_epoch(1)
+
     while env_steps < total_steps:
-        # ---- Train dynamics model every freq_train_model env steps ----
-        if env_steps % cfg.overrides.freq_train_model == 0:
-            common_util.train_model_and_save_model_and_data(
-                dynamics_model, model_trainer, cfg.overrides, replay_buffer,
-                work_dir=None,
-            )
-
-            # Refresh rollout length per schedule
-            epoch = env_steps // cfg.overrides.epoch_length
-            min_ep, max_ep, min_len, max_len = cfg.overrides.rollout_schedule
-            if epoch <= min_ep:
-                rollout_length = int(min_len)
-            elif epoch >= max_ep:
-                rollout_length = int(max_len)
-            else:
-                rollout_length = int(min_len + (epoch - min_ep) / (max_ep - min_ep) * (max_len - min_len))
-
-            new_sac_buffer_capacity = int(
-                cfg.overrides.effective_model_rollouts_per_step *
-                cfg.overrides.epoch_length *
-                cfg.overrides.num_epochs_to_retain_sac_buffer *
-                rollout_length
-            )
-            # mbrl 0.2.0 signature: (sac_buffer, obs_shape, act_shape, new_capacity, seed)
-            sac_buffer = maybe_replace_sac_buffer(
-                sac_buffer,
-                obs_shape,
-                act_shape,
-                new_sac_buffer_capacity,
-                cfg.seed,
-            )
-
-        # ---- Imagined rollouts -> SAC buffer ----
-        rollout_model_and_populate_sac_buffer(
-            model_env, replay_buffer, agent, sac_buffer,
-            cfg.algorithm.sac_samples_action, rollout_length,
-            cfg.overrides.effective_model_rollouts_per_step,
-        )
-
         # ---- One real-env step under the SAC policy ----
+        # mbrl-lib does the env step FIRST in each iteration, then triggers
+        # model training afterward when (env_steps+1) % freq_train_model == 0.
         action = agent.act(obs, sample=cfg.algorithm.sac_samples_action, batched=False)
         next_obs, reward, terminated, truncated, _ = env.step(action)
         done = terminated or truncated
@@ -325,6 +305,54 @@ def train_mbpo_with_eval(env, cfg: DictConfig, eval_callback,
         episode_step += 1
         env_steps += 1
 
+        # ---- Train dynamics model + refresh SAC buffer + generate imagined
+        # rollouts. mbrl-lib triggers this on (env_steps+1) % freq_train_model
+        # AFTER the env step, which is equivalent to env_steps % freq_train_model
+        # in our post-increment numbering. mbrl-lib also batches a full
+        # freq_train_model worth of imagined rollouts here (vs streaming them
+        # every step); we now match that pattern.
+        if env_steps % cfg.overrides.freq_train_model == 0:
+            common_util.train_model_and_save_model_and_data(
+                dynamics_model, model_trainer, cfg.overrides, replay_buffer,
+                work_dir=None,
+            )
+
+            # mbrl-lib uses 1-indexed epoch for the rollout-length schedule.
+            epoch_1_indexed = env_steps // cfg.overrides.epoch_length + 1
+            rollout_length = _rollout_length_for_epoch(epoch_1_indexed)
+
+            # mbrl-lib's sac_buffer capacity formula:
+            #   rollout_length * rollout_batch_size * trains_per_epoch * num_epochs_to_retain
+            # where rollout_batch_size = effective_model_rollouts_per_step * freq_train_model
+            # and trains_per_epoch = epoch_length / freq_train_model.
+            trains_per_epoch = max(1, cfg.overrides.epoch_length // cfg.overrides.freq_train_model)
+            rollout_batch_size = (
+                cfg.overrides.effective_model_rollouts_per_step *
+                cfg.overrides.freq_train_model
+            )
+            new_sac_buffer_capacity = int(
+                rollout_length *
+                rollout_batch_size *
+                trains_per_epoch *
+                cfg.overrides.num_epochs_to_retain_sac_buffer
+            )
+            sac_buffer = maybe_replace_sac_buffer(
+                sac_buffer,
+                obs_shape,
+                act_shape,
+                new_sac_buffer_capacity,
+                cfg.seed,
+            )
+
+            # Batched imagined rollouts — generates freq_train_model worth
+            # of fresh imagined transitions in one go, matching mbrl-lib's
+            # bursted (vs streamed) rollout pattern.
+            rollout_model_and_populate_sac_buffer(
+                model_env, replay_buffer, agent, sac_buffer,
+                cfg.algorithm.sac_samples_action, rollout_length,
+                rollout_batch_size,
+            )
+
         # ---- SAC updates ----
         # update_parameters lives on the pranz24 SAC (the network + optimizer),
         # not on the mbrl SACAgent wrapper. Reach through `agent.sac_agent`.
@@ -332,15 +360,17 @@ def train_mbpo_with_eval(env, cfg: DictConfig, eval_callback,
         # ReplayBuffer's mask field stores "terminated" in mbrl 0.2.0, but
         # pranz24's SAC expects "not terminated", so we flip it inside SAC.
         if (env_steps % cfg.overrides.sac_updates_every_steps == 0 and
+                sac_buffer is not None and
                 len(sac_buffer) >= cfg.overrides.sac_batch_size):
-            for sac_update_idx in range(cfg.overrides.num_sac_updates_per_step):
+            for _ in range(cfg.overrides.num_sac_updates_per_step):
                 agent.sac_agent.update_parameters(
                     sac_buffer,
                     cfg.overrides.sac_batch_size,
-                    env_steps * cfg.overrides.num_sac_updates_per_step + sac_update_idx,
+                    updates_made,
                     logger=None,
                     reverse_mask=True,
                 )
+                updates_made += 1
 
         if done:
             obs, _ = env.reset()
