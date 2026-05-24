@@ -9,10 +9,11 @@ venv/
 .idea/
 .vscode/
 
-# experiment outputs — large and reproducible from run_all.sh
+# experiment outputs — large and reproducible from the run scripts
 results/*.csv
 results/raw/
 results/smoke/
+results/small_scale/
 logs/
 *.log
 

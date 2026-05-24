@@ -43,10 +43,22 @@ These are kept separate from full-benchmark results in `results/*.csv` so the tw
 python -m runners.plot_results --results-dir results/smoke --out-dir plots/smoke
 ```
 
-Then run the whole benchmark (~60 hours on a single 2080 Ti at the full-benchmark budget; see `run_all.sh` for per-cell breakdown):
+There are **three scales** of experiments, in order of size:
+
+| Script | Pendulum | HalfCheetah | Wallclock | Output dir |
+|---|---|---|---|---|
+| `smoke_test.py` | 2K SAC, 500 MBPO, 2 PILCO iter | not run | ~5 min | `results/smoke/` |
+| `./run_small_scale.sh` | **20K** SAC/MBPO, **6** PILCO iter | **50K** SAC/MBPO, **5** PILCO iter | ~5–6 hr | `results/small_scale/` |
+| `./run_all.sh` (full) | 100K SAC/MBPO, 10 PILCO iter | 1M SAC/MBPO, 8 PILCO iter | ~60 hr | `results/` |
+
+Each scale writes to its own subdirectory so results never overwrite each other. Recommendation: run `smoke_test.py` first (5 min) to confirm everything works, then `./run_small_scale.sh` overnight (~5–6 hr) for slide-ready training curves, then `./run_all.sh` over a few days for the final report numbers.
 
 ```bash
+# Full benchmark (~60 hours):
 docker run --gpus all -it --rm -v "$(pwd)":/workspace kmfp ./run_all.sh
+
+# Small-scale (~5-6 hours, plottable curves for slides):
+docker run --gpus all -it --rm -v "$(pwd)":/workspace kmfp ./run_small_scale.sh
 ```
 
 Or run individual cells:
