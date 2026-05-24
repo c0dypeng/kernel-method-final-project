@@ -295,10 +295,13 @@ def train_mbpo_with_eval(env, cfg: DictConfig, eval_callback,
                 cfg.overrides.num_epochs_to_retain_sac_buffer *
                 rollout_length
             )
+            # mbrl 0.2.0 signature: (sac_buffer, obs_shape, act_shape, new_capacity, seed)
             sac_buffer = maybe_replace_sac_buffer(
-                sac_buffer, new_sac_buffer_capacity, obs_shape, act_shape,
-                torch.float32 if not cfg.algorithm.normalize_double_precision else torch.float64,
-                cfg.device,
+                sac_buffer,
+                obs_shape,
+                act_shape,
+                new_sac_buffer_capacity,
+                cfg.seed,
             )
 
         # ---- Imagined rollouts -> SAC buffer ----
@@ -312,7 +315,8 @@ def train_mbpo_with_eval(env, cfg: DictConfig, eval_callback,
         action = agent.act(obs, sample=cfg.algorithm.sac_samples_action, batched=False)
         next_obs, reward, terminated, truncated, _ = env.step(action)
         done = terminated or truncated
-        replay_buffer.add(obs, action, next_obs, reward, terminated)
+        # mbrl 0.2.0 ReplayBuffer.add takes (obs, action, next_obs, reward, terminated, truncated)
+        replay_buffer.add(obs, action, next_obs, reward, terminated, truncated)
         episode_reward += float(reward)
         episode_step += 1
         env_steps += 1
