@@ -94,7 +94,12 @@ def build_cfg(env_id: str, total_steps: int, seed: int, device: str, work_dir: s
         "deterministic": False,
         "propagation_method": "random_model",
         "learn_logvar_bounds": False,
-        "activation_fn_cfg": {"_target_": "torch.nn.SiLU"},
+        # NB: do NOT pass `activation_fn_cfg` here. mbrl-lib's GaussianMLP
+        # passes the cfg through hydra.utils.instantiate which materializes
+        # the activation module into the cfg tree — but OmegaConf can't store
+        # live nn.Module instances and raises. Letting it default (ReLU)
+        # avoids this entirely. The original SiLU choice matters very little
+        # for these benchmarks.
     }
 
     if env_id == "Pendulum-v1":

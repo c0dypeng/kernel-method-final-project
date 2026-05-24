@@ -24,11 +24,13 @@ from runners.common import EvalLogger, evaluate_policy, env_factory_for
 class PeriodicEvalCallback(BaseCallback):
     """Evaluate the current policy every `eval_freq` env steps and log to CSV."""
 
-    def __init__(self, env_id: str, logger: EvalLogger, eval_freq: int,
+    def __init__(self, env_id: str, eval_logger: EvalLogger, eval_freq: int,
                  n_eval_episodes: int, eval_seed: int, verbose: int = 0):
         super().__init__(verbose)
         self.env_id = env_id
-        self.logger = logger
+        # NB: do NOT use the name `self.logger` — BaseCallback.logger is a
+        # read-only @property in SB3 that proxies to the SB3 Logger.
+        self.eval_logger = eval_logger
         self.eval_freq = eval_freq
         self.n_eval_episodes = n_eval_episodes
         self.eval_seed = eval_seed
@@ -56,7 +58,7 @@ class PeriodicEvalCallback(BaseCallback):
             n_eval_episodes=self.n_eval_episodes,
             seed=self.eval_seed,
         )
-        self.logger.log(int(self.num_timesteps), mean_ret, std_ret)
+        self.eval_logger.log(int(self.num_timesteps), mean_ret, std_ret)
 
 
 def parse_args() -> argparse.Namespace:
@@ -102,7 +104,7 @@ def main():
 
     cb = PeriodicEvalCallback(
         env_id=args.env,
-        logger=logger,
+        eval_logger=logger,
         eval_freq=eval_freq,
         n_eval_episodes=args.n_eval_episodes,
         eval_seed=10_000 + args.seed,
