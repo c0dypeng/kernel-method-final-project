@@ -104,8 +104,20 @@ def build_cfg(env_id: str, total_steps: int, seed: int, device: str, work_dir: s
 
     if env_id == "Pendulum-v1":
         sac_hidden = 256
+        # Pendulum is small enough that length-1 imagined rollouts are fine —
+        # the dynamics model is trivially accurate at 3D state. Paper doesn't
+        # benchmark Pendulum, so we just keep mbrl-lib's safe default.
+        rollout_schedule = [20, 150, 1, 1]
     elif env_id == "HalfCheetah-v4":
         sac_hidden = 512
+        # MBPO paper's HalfCheetah config (Janner et al. 2019, Appendix Table 3):
+        # rollout length ramps from 1 to 15 over epochs 20-100. Without this,
+        # MBPO is effectively doing 1-step lookaheads and barely outperforms
+        # SAC — the headline "MBPO is sample-efficient" result requires the
+        # ramp. Risk: longer imagined trajectories compound model error
+        # (15-step rollout can hallucinate states); mitigated by the 7-model
+        # ensemble with elite selection.
+        rollout_schedule = [20, 100, 1, 15]
     else:
         raise ValueError(f"Unsupported env: {env_id}")
 
@@ -122,7 +134,7 @@ def build_cfg(env_id: str, total_steps: int, seed: int, device: str, work_dir: s
         "validation_ratio": 0.2,
         "freq_train_model": 250,
         "effective_model_rollouts_per_step": 400,
-        "rollout_schedule": [20, 150, 1, 1],
+        "rollout_schedule": rollout_schedule,
         "num_sac_updates_per_step": 10,
         "sac_updates_every_steps": 1,
         "num_epochs_to_retain_sac_buffer": 1,

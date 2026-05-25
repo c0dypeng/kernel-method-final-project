@@ -72,16 +72,12 @@ COLORS = {"sac": "#1f77b4", "mbpo": "#ff7f0e", "pilco": "#2ca02c"}
 LABELS = {"sac": "SAC", "mbpo": "MBPO", "pilco": "PILCO"}
 
 
-def plot_env(env: str, algo_runs: dict[str, list], out_path: Path):
-    # PILCO produces ~200-500 env steps; SAC/MBPO go to 50K-200K. A linear
-    # x-axis squashes PILCO into a vertical line. Use log scale + nanmean/min/max.
-    fig, ax = plt.subplots(figsize=(9, 5))
-    for algo in ("sac", "mbpo", "pilco"):
+def _plot_algos(ax, algo_runs, algos, log_x=False):
+    for algo in algos:
         runs = algo_runs.get(algo, [])
         if not runs:
             continue
         grid, Y = common_grid(runs)
-        # Use nan-aware reductions so partial coverage doesn't poison the curve.
         with np.errstate(all="ignore"):
             mean = np.nanmean(Y, axis=0)
             lo = np.nanmin(Y, axis=0)
@@ -92,18 +88,51 @@ def plot_env(env: str, algo_runs: dict[str, list], out_path: Path):
                 color=COLORS[algo], lw=2)
         ax.fill_between(grid[valid], lo[valid], hi[valid],
                         color=COLORS[algo], alpha=0.2)
-
-    ax.set_title(f"{env}: return vs environment steps (log x-axis)")
-    ax.set_xlabel("environment steps (log scale)")
+    if log_x:
+        ax.set_xscale("log")
+        ax.set_xlabel("environment steps (log scale)")
+        ax.grid(True, which="both", alpha=0.3)
+    else:
+        ax.set_xlabel("environment steps")
+        ax.grid(True, alpha=0.3)
     ax.set_ylabel("mean episode return (eval)")
-    ax.set_xscale("log")
-    ax.grid(True, which="both", alpha=0.3)
     ax.legend(loc="best")
+
+
+def plot_env(env: str, algo_runs: dict[str, list], out_dir: Path):
+    env_slug = env.lower().replace("-", "_")
+
+    # --- Plot 1: SAC vs MBPO on a linear x-axis ---
+    fig, ax = plt.subplots(figsize=(9, 5))
+    _plot_algos(ax, algo_runs, ["sac", "mbpo"], log_x=False)
+    ax.set_title(f"{env}: SAC vs MBPO — return vs environment steps")
     fig.tight_layout()
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(out_path, dpi=140)
+    p = out_dir / f"{env_slug}_sac_mbpo.png"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(p, dpi=140)
     plt.close(fig)
-    print(f"[plot] wrote {out_path}")
+    print(f"[plot] wrote {p}")
+
+    # --- Plot 2: PILCO alone ---
+    if algo_runs.get("pilco"):
+        fig, ax = plt.subplots(figsize=(9, 5))
+        _plot_algos(ax, algo_runs, ["pilco"], log_x=False)
+        ax.set_title(f"{env}: PILCO — return vs environment steps")
+        fig.tight_layout()
+        p = out_dir / f"{env_slug}_pilco.png"
+        fig.savefig(p, dpi=140)
+        plt.close(fig)
+        print(f"[plot] wrote {p}")
+
+    # --- Plot 3: all three on log x-axis (kept for reference) ---
+    fig, ax = plt.subplots(figsize=(9, 5))
+    _plot_algos(ax, algo_runs, ["sac", "mbpo", "pilco"], log_x=True)
+    ax.set_title(f"{env}: all algorithms — return vs environment steps (log x-axis)")
+    fig.tight_layout()
+    p = out_dir / f"{env_slug}_all_log.png"
+    fig.savefig(p, dpi=140)
+    plt.close(fig)
+    print(f"[plot] wrote {p}")
 
 
 def main():
@@ -119,8 +148,7 @@ def main():
 
     out_dir = Path(args.out_dir)
     for env, algo_runs in grouped.items():
-        out_path = out_dir / f"{env.lower().replace('-', '_')}_comparison.png"
-        plot_env(env, algo_runs, out_path)
+        plot_env(env, algo_runs, out_dir)
 
     # Summary table — mean of the LAST 3 evals per seed, which is more robust
     # than a single end-of-run point (especially for PILCO where the final

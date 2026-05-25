@@ -1,0 +1,7 @@
+env,algo,n_seeds,last3_return_mean,last3_return_std
+HalfCheetah-v4,sac,3,1897.14,942.66
+HalfCheetah-v4,mbpo,3,6504.53,307.75
+HalfCheetah-v4,pilco,3,-277.10,203.12
+Pendulum-v1,sac,3,-119.88,18.32
+Pendulum-v1,mbpo,3,-122.44,19.23
+Pendulum-v1,pilco,3,-317.62,130.87
