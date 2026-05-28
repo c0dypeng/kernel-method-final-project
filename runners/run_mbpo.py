@@ -57,15 +57,27 @@ def build_cfg(env_id: str, total_steps: int, seed: int, device: str, work_dir: s
     overrides/mbpo_<env>.yaml structure, with values inlined (no hydra
     interpolation strings — those don't resolve outside hydra runtime)."""
 
+    # epoch_length controls how often mbrl-lib runs eval (every epoch_length
+    # env steps). We use 500 to match the cadence the SAC runner produces.
+    # NB: the rollout_schedule below is in EPOCH units, so when we halve
+    # epoch_length from mbrl-lib's default 1000 down to 500, we double the
+    # epoch markers in the schedule to preserve the env-step boundaries the
+    # paper specifies.
+    epoch_length = 500
+
     if env_id == "Pendulum-v1":
         sac_hidden = 256
-        # Pendulum: small 3D state, length-1 rollouts are fine.
-        rollout_schedule = [20, 150, 1, 1]
+        # Pendulum: small 3D state, length-1 rollouts are fine throughout.
+        # mbrl-lib default [20, 150, 1, 1] at epoch_length=1000 → epochs at
+        # env_steps 20K, 150K. At epoch_length=500 that becomes [40, 300].
+        rollout_schedule = [40, 300, 1, 1]
     elif env_id == "HalfCheetah-v4":
         sac_hidden = 512
-        # MBPO paper's HalfCheetah config (Janner et al. 2019, App. Table 3):
-        # rollout length ramps 1 -> 15 over epochs 20-100.
-        rollout_schedule = [20, 100, 1, 15]
+        # MBPO paper Janner et al. 2019, App. Table 3 specifies the schedule
+        # in env-step terms: rollouts length 1 until ~20K env steps, ramp to
+        # 15 by ~100K env steps. At epoch_length=500 that maps to epochs
+        # 40 -> 200.
+        rollout_schedule = [40, 200, 1, 15]
     else:
         raise ValueError(f"unsupported env: {env_id}")
 
@@ -73,7 +85,7 @@ def build_cfg(env_id: str, total_steps: int, seed: int, device: str, work_dir: s
         "env": f"gym___{env_id}",
         "term_fn": "no_termination",
         "num_steps": total_steps,
-        "epoch_length": 1000,
+        "epoch_length": epoch_length,
         "num_elites": 5,
         "patience": 5,
         "model_lr": 1e-3,

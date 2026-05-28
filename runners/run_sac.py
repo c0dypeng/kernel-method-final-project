@@ -27,8 +27,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--steps", type=int, required=True, help="total env steps to train")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--results-dir", default="results")
-    p.add_argument("--eval-freq", type=int, default=None,
-                   help="evaluate every N env steps (default: max(steps/20, 1))")
+    p.add_argument("--eval-freq", type=int, default=500,
+                   help="evaluate every N env steps (default: 500, matches the "
+                        "cadence MBPO uses via mbrl-lib's epoch_length)")
     p.add_argument("--n-eval-episodes", type=int, default=5)
     p.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda"])
     return p.parse_args()
@@ -64,7 +65,7 @@ def npz_to_unified_csv(npz_path: Path, csv_path: Path, start_time: float) -> Non
 
 def main():
     args = parse_args()
-    eval_freq = args.eval_freq or max(args.steps // 20, 1)
+    eval_freq = args.eval_freq
 
     csv_path = Path(args.results_dir) / f"sac__{args.env}__seed{args.seed}.csv"
     print(f"[sac] env={args.env} steps={args.steps} seed={args.seed} device={args.device}")
