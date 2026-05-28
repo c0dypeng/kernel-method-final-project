@@ -23,20 +23,48 @@ from pathlib import Path
 import numpy as np
 import torch
 import gymnasium as gym
-from omegaconf import OmegaConf, DictConfig
+from omegaconf import OmegaConf, DictConfig, ListConfig
 
 # Compatibility shim: mbrl-lib was written against classic `gym`, our project
 # uses `gymnasium`. Map `gym.spaces.Box` to gymnasium's equivalent so mbrl's
 # `_target_: gym.spaces.Box` lookups resolve.
+def _coerce_box_arg(v):
+    """Convert OmegaConf containers → numpy arrays so gymnasium.spaces.Box
+    doesn't receive ListConfig or plain list (both fail its is_float_integer
+    check, leaving _low as a list and breaking -np.inf < _low)."""
+    if isinstance(v, (ListConfig, DictConfig)):
+        v = OmegaConf.to_container(v, resolve=True)
+    if isinstance(v, list):
+        v = np.asarray(v)
+    return v
+
+
 try:
     import gym as _classic_gym  # noqa: F401
+    import gym.spaces as _gym_spaces  # noqa: F401
+
+    _orig_classic_Box = _gym_spaces.Box
+
+    class _SafeClassicBox(_orig_classic_Box):
+        def __init__(self, low, high=None, shape=None, **kw):
+            super().__init__(_coerce_box_arg(low), _coerce_box_arg(high), shape, **kw)
+
+    _gym_spaces.Box = _SafeClassicBox
+    sys.modules["gym"].spaces.Box = _SafeClassicBox
 except ImportError:
     import gymnasium.spaces as _spaces
+
+    _orig_Box = _spaces.Box
+
+    class _SafeBox(_orig_Box):
+        def __init__(self, low, high=None, shape=None, **kw):
+            super().__init__(_coerce_box_arg(low), _coerce_box_arg(high), shape, **kw)
+
     _shim = types.ModuleType("gym")
     _shim.env = types.ModuleType("gym.env")
-    _shim.env.Box = _spaces.Box
+    _shim.env.Box = _SafeBox
     _shim.spaces = types.ModuleType("gym.spaces")
-    _shim.spaces.Box = _spaces.Box
+    _shim.spaces.Box = _SafeBox
     sys.modules.setdefault("gym", _shim)
     sys.modules.setdefault("gym.env", _shim.env)
     sys.modules.setdefault("gym.spaces", _shim.spaces)
