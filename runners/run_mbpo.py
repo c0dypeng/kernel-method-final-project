@@ -1,25 +1,23 @@
-"""MBPO runner via facebookresearch/mbrl-lib.
+"""MBPO runner — calls facebookresearch/mbrl-lib's mbpo.train() directly.
 
-Drives MBPO in chunks and runs the same `evaluate_policy` between chunks that
-the SAC and PILCO runners use, so all three produce identical CSV schemas.
-
-This is a more invasive integration than calling `mbpo.train` directly — we
-have to reach into mbrl-lib's internals to run training for N steps and then
-hand control back to us for an eval. mbrl-lib doesn't expose a public "step N
-times" API, so we replicate the relevant portion of `train()` here. The
-algorithm is unchanged; only the outer loop differs.
+Previous versions of this file reimplemented mbrl-lib's training loop from
+scratch to hook in periodic eval. That accumulated 9+ bugs. mbrl-lib already
+ships periodic eval at epoch boundaries and writes CSVs; we just call its
+train function and post-process the output into the unified schema.
 
 Usage:
-    python -m runners.run_mbpo --env Pendulum-v1   --steps 50000  --seed 0
-    python -m runners.run_mbpo --env HalfCheetah-v4 --steps 200000 --seed 0
+    python -m runners.run_mbpo --env Pendulum-v1   --steps 100000  --seed 0
+    python -m runners.run_mbpo --env HalfCheetah-v4 --steps 1000000 --seed 0
 """
 from __future__ import annotations
 
 import argparse
-import os
+import csv
+import shutil
 import sys
 import tempfile
-import warnings
+import time
+import types
 from pathlib import Path
 
 import numpy as np
@@ -27,13 +25,12 @@ import torch
 import gymnasium as gym
 from omegaconf import OmegaConf, DictConfig
 
-# mbrl's SAC agent config has _target_: gym.env.Box (typo in upstream, but harmless if
-# `gym` is importable). Provide a compatibility shim so a pure-gymnasium env works.
+# Compatibility shim: mbrl-lib was written against classic `gym`, our project
+# uses `gymnasium`. Map `gym.spaces.Box` to gymnasium's equivalent so mbrl's
+# `_target_: gym.spaces.Box` lookups resolve.
 try:
     import gym as _classic_gym  # noqa: F401
 except ImportError:
-    # Build a minimal `gym.env.Box` -> `gymnasium.spaces.Box` shim and inject it.
-    import types
     import gymnasium.spaces as _spaces
     _shim = types.ModuleType("gym")
     _shim.env = types.ModuleType("gym.env")
@@ -44,82 +41,33 @@ except ImportError:
     sys.modules.setdefault("gym.env", _shim.env)
     sys.modules.setdefault("gym.spaces", _shim.spaces)
 
-import mbrl.constants
-import mbrl.models
-import mbrl.planning
-import mbrl.third_party.pytorch_sac_pranz24.utils as sac_utils
-import mbrl.util.common as common_util
-import mbrl.util.replay_buffer
-from mbrl.algorithms.mbpo import (
-    MBPO_LOG_FORMAT,
-    rollout_model_and_populate_sac_buffer,
-    maybe_replace_sac_buffer,
-)
-
-from runners.common import EvalLogger, evaluate_policy, env_factory_for
+import mbrl.algorithms.mbpo as mbpo
 
 
-# ---------------------------------------------------------------------------
-# Termination function.
-# mbrl-lib expects (act, next_obs) -> torch.BoolTensor of shape (N, 1).
-# Both Pendulum and HalfCheetah are "no termination, timeout-only" envs.
-# ---------------------------------------------------------------------------
 def no_termination_fn(act, next_obs):
+    """Termination predicate for Pendulum and HalfCheetah (both timeout-only).
+    Returns shape (N, 1) BoolTensor per mbrl's TermFnType contract.
+    """
     done = torch.zeros(next_obs.shape[0], dtype=torch.bool, device=next_obs.device)
     return done[:, None]
 
 
-# ---------------------------------------------------------------------------
-# Per-env mbrl config. Skeleton mirrors mbrl-lib's mbpo.yaml + a HalfCheetah-shape override.
-# ---------------------------------------------------------------------------
 def build_cfg(env_id: str, total_steps: int, seed: int, device: str, work_dir: str) -> DictConfig:
-    common = {
-        "seed": seed,
-        "device": device,
-        "log_frequency_agent": 1000,
-        "save_video": False,
-        "experiment": "default",
-        "debug_mode": False,
-        "root_dir": work_dir,
-    }
-
-    dynamics_model = {
-        "_target_": "mbrl.models.GaussianMLP",
-        "device": device,
-        "num_layers": 4,
-        "in_size": "???",
-        "out_size": "???",
-        "ensemble_size": 7,
-        "hid_size": 200,
-        "deterministic": False,
-        "propagation_method": "random_model",
-        "learn_logvar_bounds": False,
-        # NB: do NOT pass `activation_fn_cfg` here. mbrl-lib's GaussianMLP
-        # passes the cfg through hydra.utils.instantiate which materializes
-        # the activation module into the cfg tree — but OmegaConf can't store
-        # live nn.Module instances and raises. Letting it default (ReLU)
-        # avoids this entirely. The original SiLU choice matters very little
-        # for these benchmarks.
-    }
+    """Construct an mbrl-lib DictConfig matching the library's mbpo.yaml +
+    overrides/mbpo_<env>.yaml structure, with values inlined (no hydra
+    interpolation strings — those don't resolve outside hydra runtime)."""
 
     if env_id == "Pendulum-v1":
         sac_hidden = 256
-        # Pendulum is small enough that length-1 imagined rollouts are fine —
-        # the dynamics model is trivially accurate at 3D state. Paper doesn't
-        # benchmark Pendulum, so we just keep mbrl-lib's safe default.
+        # Pendulum: small 3D state, length-1 rollouts are fine.
         rollout_schedule = [20, 150, 1, 1]
     elif env_id == "HalfCheetah-v4":
         sac_hidden = 512
-        # MBPO paper's HalfCheetah config (Janner et al. 2019, Appendix Table 3):
-        # rollout length ramps from 1 to 15 over epochs 20-100. Without this,
-        # MBPO is effectively doing 1-step lookaheads and barely outperforms
-        # SAC — the headline "MBPO is sample-efficient" result requires the
-        # ramp. Risk: longer imagined trajectories compound model error
-        # (15-step rollout can hallucinate states); mitigated by the 7-model
-        # ensemble with elite selection.
+        # MBPO paper's HalfCheetah config (Janner et al. 2019, App. Table 3):
+        # rollout length ramps 1 -> 15 over epochs 20-100.
         rollout_schedule = [20, 100, 1, 15]
     else:
-        raise ValueError(f"Unsupported env: {env_id}")
+        raise ValueError(f"unsupported env: {env_id}")
 
     overrides = {
         "env": f"gym___{env_id}",
@@ -150,14 +98,19 @@ def build_cfg(env_id: str, total_steps: int, seed: int, device: str, work_dir: s
         "sac_batch_size": 256,
     }
 
-    # NB: mbrl-lib's hydra YAML uses ${overrides.sac_xxx} interpolation
-    # strings, but those only resolve when hydra builds the whole config
-    # tree at once. When we construct the OmegaConf programmatically and
-    # mbrl reads cfg.algorithm.agent.args.gamma via hydra.utils.instantiate,
-    # the interpolation triggers and OmegaConf 2.1.2 raises
-    # InterpolationKeyError because the parent context isn't set the way
-    # hydra would set it. Inline the values from the `overrides` dict
-    # directly — same effect, no resolution path required.
+    dynamics_model = {
+        "_target_": "mbrl.models.GaussianMLP",
+        "device": device,
+        "num_layers": 4,
+        "in_size": "???",
+        "out_size": "???",
+        "ensemble_size": 7,
+        "hid_size": 200,
+        "deterministic": False,
+        "propagation_method": "random_model",
+        "learn_logvar_bounds": False,
+    }
+
     algorithm = {
         "name": "mbpo",
         "normalize": True,
@@ -169,13 +122,16 @@ def build_cfg(env_id: str, total_steps: int, seed: int, device: str, work_dir: s
         "sac_samples_action": True,
         "initial_exploration_steps": 5000,
         "random_initial_explore": False,
-        "num_eval_episodes": 1,
-        # NB: no _target_ / num_inputs / action_space here. We construct the
-        # SAC agent directly in train_mbpo_with_eval() to bypass hydra's
-        # OmegaConf -> ListConfig round-trip which corrupts the Box space.
-        # Only `args` is carried in the config so the SAC hyperparams are
-        # still accessible via cfg.algorithm.agent.args.<name>.
+        "num_eval_episodes": 5,
         "agent": {
+            "_target_": "mbrl.third_party.pytorch_sac_pranz24.sac.SAC",
+            "num_inputs": "???",
+            "action_space": {
+                "_target_": "gym.spaces.Box",
+                "low": "???",
+                "high": "???",
+                "shape": "???",
+            },
             "args": {
                 "gamma": overrides["sac_gamma"],
                 "tau": overrides["sac_tau"],
@@ -192,7 +148,13 @@ def build_cfg(env_id: str, total_steps: int, seed: int, device: str, work_dir: s
     }
 
     return OmegaConf.create({
-        **common,
+        "seed": seed,
+        "device": device,
+        "log_frequency_agent": 1000,
+        "save_video": False,
+        "experiment": "default",
+        "debug_mode": False,
+        "root_dir": work_dir,
         "algorithm": algorithm,
         "dynamics_model": dynamics_model,
         "overrides": overrides,
@@ -206,257 +168,101 @@ def make_env(env_id: str, seed: int):
     return env
 
 
-# ---------------------------------------------------------------------------
-# Custom MBPO train loop with explicit eval hooks.
-# This replicates the inner loop of mbrl.algorithms.mbpo.train but yields control
-# to us after every `eval_every` env steps so we can run our unified eval.
-# ---------------------------------------------------------------------------
-def train_mbpo_with_eval(env, cfg: DictConfig, eval_callback,
-                         eval_every: int, total_steps: int):
-    """Run MBPO; call `eval_callback(env_step)` every `eval_every` env steps."""
-    rng = np.random.default_rng(cfg.seed)
-    torch_rng = torch.Generator(device=cfg.device)
-    torch_rng.manual_seed(cfg.seed)
+def mbrl_csv_to_unified(work_dir: Path, dst_csv: Path, start_time: float) -> None:
+    """mbrl-lib writes results.csv with columns like:
+       env_step, episode_reward, ...
+    Convert into our schema (env_steps, mean_return, std_return, wallclock_s).
+    """
+    candidates = sorted(work_dir.glob("**/results.csv"))
+    if not candidates:
+        candidates = sorted(work_dir.glob("**/*.csv"))
+    if not candidates:
+        raise RuntimeError(f"mbrl produced no CSV in {work_dir}")
+    src = candidates[0]
+    print(f"[mbpo] mbrl CSV source: {src}")
 
-    # ---- Build dynamics model + agent (mirrors mbpo.train setup) ----
-    obs_shape = env.observation_space.shape
-    act_shape = env.action_space.shape
+    rows: dict[int, list[float]] = {}
+    with open(src) as f:
+        reader = csv.DictReader(f)
+        for r in reader:
+            step_key = next((k for k in ("env_step", "step") if k in r), None)
+            ret_key = next((k for k in ("episode_reward", "episode_return", "eval_return") if k in r), None)
+            if step_key is None or ret_key is None:
+                continue
+            try:
+                step = int(float(r[step_key]))
+                ret = float(r[ret_key])
+            except (ValueError, TypeError):
+                continue
+            rows.setdefault(step, []).append(ret)
 
-    dynamics_model = common_util.create_one_dim_tr_model(cfg, obs_shape, act_shape)
-
-    # Replay buffers
-    replay_buffer = mbrl.util.replay_buffer.ReplayBuffer(
-        capacity=cfg.overrides.num_steps + cfg.algorithm.initial_exploration_steps,
-        obs_shape=obs_shape,
-        action_shape=act_shape,
-        rng=rng,
-    )
-    common_util.rollout_agent_trajectories(
-        env,
-        cfg.algorithm.initial_exploration_steps,
-        mbrl.planning.RandomAgent(env),
-        {},
-        replay_buffer=replay_buffer,
-    )
-
-    # SAC agent — bypass hydra.utils.instantiate entirely.
-    #
-    # mbrl-lib's stock approach is `hydra.utils.instantiate(cfg.algorithm.agent)`
-    # which then recursively instantiates the nested action_space sub-config
-    # as `gym.spaces.Box(low=..., high=..., shape=...)`. But OmegaConf turns
-    # plain Python lists into ListConfig objects during round-trip, and
-    # `gym.spaces.Box.__init__` does `low < high` element-wise comparisons
-    # that crash with TypeError on ListConfig values.
-    #
-    # Build the SAC stack in two steps, exactly like mbrl-lib does internally:
-    #   1. pranz24's SAC implementation (the actual network + optimizer)
-    #   2. mbrl.planning.SACAgent wrapper that exposes the .act(obs, sample,
-    #      batched) API the rollout/inner loops call.
-    # Without step 2, agent.act(...) raises AttributeError because pranz24's
-    # raw SAC exposes .select_action(...), not .act(...).
-    from mbrl.third_party.pytorch_sac_pranz24.sac import SAC as _Pranz24SAC
-    from mbrl.planning.sac_wrapper import SACAgent as _MbrlSACAgent
-    sac_args = cfg.algorithm.agent.args  # OmegaConf DictConfig — attribute access works
-    pranz24_sac = _Pranz24SAC(
-        num_inputs=obs_shape[0],
-        action_space=env.action_space,
-        args=sac_args,
-    )
-    agent = _MbrlSACAgent(pranz24_sac)
-
-    model_env = mbrl.models.ModelEnv(
-        env, dynamics_model, no_termination_fn,
-        generator=torch_rng,
-    )
-    model_trainer = mbrl.models.ModelTrainer(
-        dynamics_model,
-        optim_lr=cfg.overrides.model_lr,
-        weight_decay=cfg.overrides.model_wd,
-    )
-
-    # Rollout-length schedule
-    rollout_length = int(cfg.overrides.rollout_schedule[2])
-
-    # Stats for SAC training
-    sac_buffer = None
-    env_steps = 0
-    obs, _ = env.reset(seed=cfg.seed + 1)
-    episode_reward = 0.0
-    episode_step = 0
-    next_eval_at = 0
-
-    print(f"[mbpo] starting main loop; total_steps={total_steps}, eval_every={eval_every}")
-
-    # Monotonic counter for SAC updates — used as the `updates` arg, matches
-    # mbrl-lib's behavior where this only increments when an update fires.
-    updates_made = 0
-
-    # Initial rollout length for epoch 0 (mbrl-lib uses 1-indexed epoch in
-    # the schedule lookup).
-    def _rollout_length_for_epoch(epoch_1_indexed: int) -> int:
-        min_ep, max_ep, min_len, max_len = cfg.overrides.rollout_schedule
-        e = epoch_1_indexed
-        if e <= min_ep:
-            return int(min_len)
-        if e >= max_ep:
-            return int(max_len)
-        return int(min_len + (e - min_ep) / (max_ep - min_ep) * (max_len - min_len))
-
-    rollout_length = _rollout_length_for_epoch(1)
-
-    while env_steps < total_steps:
-        # ---- One real-env step under the SAC policy ----
-        # mbrl-lib does the env step FIRST in each iteration, then triggers
-        # model training afterward when (env_steps+1) % freq_train_model == 0.
-        action = agent.act(obs, sample=cfg.algorithm.sac_samples_action, batched=False)
-        next_obs, reward, terminated, truncated, _ = env.step(action)
-        done = terminated or truncated
-        # mbrl 0.2.0 ReplayBuffer.add takes (obs, action, next_obs, reward, terminated, truncated)
-        replay_buffer.add(obs, action, next_obs, reward, terminated, truncated)
-        episode_reward += float(reward)
-        episode_step += 1
-        env_steps += 1
-
-        # ---- Train dynamics model + refresh SAC buffer + generate imagined
-        # rollouts. mbrl-lib triggers this on (env_steps+1) % freq_train_model
-        # AFTER the env step, which is equivalent to env_steps % freq_train_model
-        # in our post-increment numbering. mbrl-lib also batches a full
-        # freq_train_model worth of imagined rollouts here (vs streaming them
-        # every step); we now match that pattern.
-        if env_steps % cfg.overrides.freq_train_model == 0:
-            common_util.train_model_and_save_model_and_data(
-                dynamics_model, model_trainer, cfg.overrides, replay_buffer,
-                work_dir=None,
-            )
-
-            # mbrl-lib uses 1-indexed epoch for the rollout-length schedule.
-            epoch_1_indexed = env_steps // cfg.overrides.epoch_length + 1
-            rollout_length = _rollout_length_for_epoch(epoch_1_indexed)
-
-            # mbrl-lib's sac_buffer capacity formula:
-            #   rollout_length * rollout_batch_size * trains_per_epoch * num_epochs_to_retain
-            # where rollout_batch_size = effective_model_rollouts_per_step * freq_train_model
-            # and trains_per_epoch = epoch_length / freq_train_model.
-            trains_per_epoch = max(1, cfg.overrides.epoch_length // cfg.overrides.freq_train_model)
-            rollout_batch_size = (
-                cfg.overrides.effective_model_rollouts_per_step *
-                cfg.overrides.freq_train_model
-            )
-            new_sac_buffer_capacity = int(
-                rollout_length *
-                rollout_batch_size *
-                trains_per_epoch *
-                cfg.overrides.num_epochs_to_retain_sac_buffer
-            )
-            sac_buffer = maybe_replace_sac_buffer(
-                sac_buffer,
-                obs_shape,
-                act_shape,
-                new_sac_buffer_capacity,
-                cfg.seed,
-            )
-
-            # Batched imagined rollouts — generates freq_train_model worth
-            # of fresh imagined transitions in one go, matching mbrl-lib's
-            # bursted (vs streamed) rollout pattern.
-            rollout_model_and_populate_sac_buffer(
-                model_env, replay_buffer, agent, sac_buffer,
-                cfg.algorithm.sac_samples_action, rollout_length,
-                rollout_batch_size,
-            )
-
-        # ---- SAC updates ----
-        # update_parameters lives on the pranz24 SAC (the network + optimizer),
-        # not on the mbrl SACAgent wrapper. Reach through `agent.sac_agent`.
-        # `reverse_mask=True` matches what mbrl's own train() does — the
-        # ReplayBuffer's mask field stores "terminated" in mbrl 0.2.0, but
-        # pranz24's SAC expects "not terminated", so we flip it inside SAC.
-        if (env_steps % cfg.overrides.sac_updates_every_steps == 0 and
-                sac_buffer is not None and
-                len(sac_buffer) >= cfg.overrides.sac_batch_size):
-            for _ in range(cfg.overrides.num_sac_updates_per_step):
-                agent.sac_agent.update_parameters(
-                    sac_buffer,
-                    cfg.overrides.sac_batch_size,
-                    updates_made,
-                    logger=None,
-                    reverse_mask=True,
-                )
-                updates_made += 1
-
-        if done:
-            obs, _ = env.reset()
-            episode_reward = 0.0
-            episode_step = 0
-        else:
-            obs = next_obs
-
-        # ---- Eval hook ----
-        if env_steps >= next_eval_at:
-            next_eval_at = env_steps + eval_every
-            eval_callback(env_steps, agent)
-
-    eval_callback(env_steps, agent)
-    return agent
+    dst_csv.parent.mkdir(parents=True, exist_ok=True)
+    with open(dst_csv, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["env_steps", "mean_return", "std_return", "wallclock_s"])
+        n = max(len(rows), 1)
+        for i, step in enumerate(sorted(rows.keys())):
+            arr = np.asarray(rows[step])
+            w.writerow([
+                step,
+                float(arr.mean()),
+                float(arr.std()),
+                float((time.time() - start_time) * (i + 1) / n),
+            ])
 
 
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
     p.add_argument("--env", required=True, choices=["Pendulum-v1", "HalfCheetah-v4"])
     p.add_argument("--steps", type=int, required=True)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--results-dir", default="results")
-    p.add_argument("--eval-freq", type=int, default=None,
-                   help="evaluate every N env steps (default: steps/20)")
-    p.add_argument("--n-eval-episodes", type=int, default=5)
     p.add_argument("--device", default="cuda")
+    # --eval-freq / --n-eval-episodes are accepted for CLI compatibility with
+    # the other runners but ignored: mbrl-lib controls eval cadence internally
+    # via epoch_length (1000 env steps) and num_eval_episodes (5).
+    p.add_argument("--eval-freq", type=int, default=None, help="(ignored)")
+    p.add_argument("--n-eval-episodes", type=int, default=5, help="(ignored)")
     return p.parse_args()
 
 
 def main():
     args = parse_args()
-    eval_freq = args.eval_freq or max(args.steps // 20, 1)
-
-    csv_path = Path(args.results_dir) / f"mbpo__{args.env}__seed{args.seed}.csv"
     print(f"[mbpo] env={args.env} steps={args.steps} seed={args.seed} device={args.device}")
-    print(f"[mbpo] eval_freq={eval_freq}  -> {csv_path}")
 
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
 
-    logger = EvalLogger.open(csv_path)
-    work_dir = tempfile.mkdtemp(prefix=f"mbpo_{args.env}_seed{args.seed}_")
-    cfg = build_cfg(args.env, args.steps, args.seed, args.device, work_dir)
+    work_dir = Path(tempfile.mkdtemp(prefix=f"mbpo_{args.env}_seed{args.seed}_"))
+    print(f"[mbpo] mbrl-lib work_dir={work_dir}")
+
+    cfg = build_cfg(args.env, args.steps, args.seed, args.device, str(work_dir))
 
     env = make_env(args.env, args.seed)
+    test_env = make_env(args.env, 10_000 + args.seed)
 
-    def eval_callback(env_step: int, agent):
-        """Run the same evaluate_policy() that SAC/PILCO use so the CSVs match."""
-        def act_fn(obs):
-            # `agent.act(obs, sample=False)` returns the deterministic mean action.
-            return agent.act(obs, sample=False, batched=False)
+    start_time = time.time()
+    mbpo.train(
+        env=env,
+        test_env=test_env,
+        termination_fn=no_termination_fn,
+        cfg=cfg,
+        silent=False,
+        work_dir=str(work_dir),
+    )
 
-        mean_r, std_r = evaluate_policy(
-            env_factory=env_factory_for(args.env),
-            act_fn=act_fn,
-            n_eval_episodes=args.n_eval_episodes,
-            seed=10_000 + args.seed,
-        )
-        logger.log(env_step, mean_r, std_r)
+    dst_csv = Path(args.results_dir) / f"mbpo__{args.env}__seed{args.seed}.csv"
+    mbrl_csv_to_unified(work_dir, dst_csv, start_time)
 
-    try:
-        train_mbpo_with_eval(
-            env, cfg, eval_callback,
-            eval_every=eval_freq,
-            total_steps=args.steps,
-        )
-    finally:
-        env.close()
+    # Keep raw mbrl outputs alongside our unified CSV.
+    raw_dst = Path(args.results_dir) / "raw" / f"mbpo__{args.env}__seed{args.seed}"
+    raw_dst.mkdir(parents=True, exist_ok=True)
+    for csv_file in work_dir.glob("**/*.csv"):
+        shutil.copy(csv_file, raw_dst / csv_file.name)
 
-    print(f"[mbpo] done -> {csv_path}")
+    env.close()
+    test_env.close()
+    print(f"[mbpo] done -> {dst_csv}")
 
 
 if __name__ == "__main__":
