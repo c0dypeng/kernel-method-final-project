@@ -102,21 +102,21 @@ PyTorch and TensorFlow each bring their own CUDA runtime wheels — no conflict.
 
 ## Evaluation protocol
 
-To make the algorithms directly comparable, **every runner uses the exact same evaluation function** (`evaluate_policy` in `runners/common.py`) and logs to the same CSV schema:
+Every runner produces a CSV with the same schema:
 
 ```
 env_steps, mean_return, std_return, wallclock_s
 ```
 
 - **env_steps** = cumulative real-environment transitions consumed (the universally-meaningful x-axis for sample efficiency).
-- **mean_return / std_return** = mean and std of episode returns from `n_eval_episodes` deterministic-policy rollouts in a fresh env (no exploration noise). Default is 5 episodes per eval.
+- **mean_return / std_return** = mean and std of episode returns from 5 deterministic-policy rollouts in a fresh env (no exploration noise).
 
-Eval cadence:
-- **SAC**: every `total_steps/20` env steps (so 20 eval points per run).
-- **MBPO**: same — `total_steps/20`. The runner explicitly hooks into the MBPO inner loop to run an eval at fixed intervals (mbrl-lib's built-in CSV is only logged once per epoch with `num_eval_episodes=1`, which is too sparse and has no error bars; we override it).
-- **PILCO**: once per outer iteration (~10 evals total per run).
+The runners are thin wrappers around battle-tested library code:
+- **SAC**: `stable-baselines3.SAC` + SB3's built-in `EvalCallback`. Eval cadence is the `--eval-freq` flag, defaulting to every 500 env steps.
+- **MBPO**: `mbrl.algorithms.mbpo.train()` from facebookresearch/mbrl-lib. Eval cadence is fixed by `epoch_length=500`, so eval runs every 500 env steps with 5 episodes per eval. The HalfCheetah rollout-length schedule follows the MBPO paper (Janner et al. 2019, App. Table 3): length-1 imagined rollouts until 20K env steps, then linear ramp to length-15 by 100K env steps.
+- **PILCO**: custom runner around the algorithm code from c0dypeng/PILCO-modern (no library ships PILCO). One eval per outer iteration (~10 evals per run). Uses `evaluate_policy` in `runners/common.py` for the eval step.
 
-This is what makes the training curves comparable — same metric, same number of eval episodes, same deterministic policy.
+This means SAC and MBPO produce **200 eval points per 100K env steps** (= 2000 on the full HalfCheetah-1M run). PILCO produces ~10 eval points per run because it's iteration-bounded, not step-bounded.
 
 ### Plot axes
 
