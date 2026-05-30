@@ -96,16 +96,22 @@ def build_cfg(env_id: str, total_steps: int, seed: int, device: str, work_dir: s
     if env_id == "Pendulum-v1":
         sac_hidden = 256
         # Pendulum: small 3D state, length-1 rollouts are fine throughout.
-        # mbrl-lib default [20, 150, 1, 1] at epoch_length=1000 → epochs at
-        # env_steps 20K, 150K. At epoch_length=500 that becomes [40, 300].
         rollout_schedule = [40, 300, 1, 1]
+        num_sac_updates = 10
     elif env_id == "HalfCheetah-v4":
         sac_hidden = 512
-        # MBPO paper Janner et al. 2019, App. Table 3 specifies the schedule
-        # in env-step terms: rollouts length 1 until ~20K env steps, ramp to
-        # 15 by ~100K env steps. At epoch_length=500 that maps to epochs
-        # 40 -> 200.
-        rollout_schedule = [40, 200, 1, 15]
+        # MBPO paper (Janner et al. 2019, Appendix C, Table 1):
+        #   HalfCheetah uses model horizon k=1 throughout (no ramp).
+        #   The 1->15 / 1->25 ramps in the paper apply to Hopper / Walker2d /
+        #   Humanoid, NOT to HalfCheetah. Setting k=15 here caused the
+        #   compounding autoregressive model error -> policy collapse we
+        #   observed around env step 50K. Reverting to k=1 matches both the
+        #   paper and mbrl-lib's own mbpo_halfcheetah.yaml.
+        rollout_schedule = [40, 300, 1, 1]
+        # Same paper table: HalfCheetah uses G=40 policy updates per env step
+        # (the other envs use G=20). Our SAC was previously under-trained at
+        # G=10. Bumping to 40 matches the paper.
+        num_sac_updates = 40
     else:
         raise ValueError(f"unsupported env: {env_id}")
 
@@ -123,7 +129,7 @@ def build_cfg(env_id: str, total_steps: int, seed: int, device: str, work_dir: s
         "freq_train_model": 250,
         "effective_model_rollouts_per_step": 400,
         "rollout_schedule": rollout_schedule,
-        "num_sac_updates_per_step": 10,
+        "num_sac_updates_per_step": num_sac_updates,
         "sac_updates_every_steps": 1,
         "num_epochs_to_retain_sac_buffer": 1,
         "sac_gamma": 0.99,
